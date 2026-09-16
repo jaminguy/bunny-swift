@@ -14,8 +14,22 @@ import Recovery
 /// Type alias to disambiguate from Objective-C Method
 public typealias AMQPMethod = AMQPProtocol.Method
 
+/// The connection surface a `Channel` drives. `Connection` is the production
+/// conformer; tests stand in a stub so channel-level interleavings can be forced
+/// without a broker.
+internal protocol ChannelConnection: AnyObject, Sendable {
+  var topologyRegistry: TopologyRegistry { get }
+  var frameMax: UInt32 { get async }
+  func send(_ frame: Frame) async throws
+  func writeBatch(_ frames: [Frame]) async throws
+  func flush() async
+  func channelClosed(_ channelID: UInt16) async
+}
+
+extension Connection: ChannelConnection {}
+
 public actor Channel {
-  private weak var connection: Connection?
+  private weak var connection: (any ChannelConnection)?
   private let channelID: UInt16
   private var isOpen = false
   private var confirmMode = false
@@ -51,9 +65,20 @@ public actor Channel {
   private var outstandingConfirmsCount: Int = 0
   private var confirmLimitWaiters: [CheckedContinuation<Void, Never>] = []
 
+  /// In confirm mode one publish at a time holds this gate from reading its
+  /// sequence number until its frames are written and the number advanced.
+  /// `Channel` is a reentrant actor: without the gate two publishes interleave
+  /// at the awaits in between, take the same number, and one confirm waiter
+  /// overwrites the other. The broker numbers deliveries in the order frames
+  /// arrive, so the number and the write must also be one unit against every
+  /// other publisher. The gate hands on in arrival order and is released before
+  /// the confirm is awaited, so confirm waits still overlap.
+  private var publishGateHeld = false
+  private var publishGateWaiters: [CheckedContinuation<Void, Never>] = []
+
   // MARK: - Initialization
 
-  internal init(connection: Connection, channelID: UInt16) {
+  internal init(connection: any ChannelConnection, channelID: UInt16) {
     self.connection = connection
     self.channelID = channelID
   }
@@ -440,9 +465,17 @@ public actor Channel {
     }
 
     if publisherConfirmationTracking {
-      await waitForConfirmSlot()
+      try await waitForConfirmSlot()
     }
 
+    if confirmMode {
+      await acquirePublishGate()
+      // The channel may have closed while this publish waited its turn.
+      guard isOpen else {
+        releasePublishGate()
+        throw ConnectionError.notConnected
+      }
+    }
     let seqNo = confirmMode ? nextPublishSeqNo : 0
 
     let frames = buildPublishFrames(
@@ -455,11 +488,19 @@ public actor Channel {
       frameMax: await connection.frameMax
     )
 
-    try await connection.writeBatch(frames)
+    do {
+      try await connection.writeBatch(frames)
+    } catch {
+      if confirmMode {
+        releasePublishGate()
+      }
+      throw error
+    }
     await connection.flush()
 
     if confirmMode {
       nextPublishSeqNo += 1
+      releasePublishGate()
       if publisherConfirmationTracking {
         try await awaitConfirmation(seqNo: seqNo)
       }
@@ -482,9 +523,17 @@ public actor Channel {
     }
 
     if publisherConfirmationTracking {
-      await waitForConfirmSlot()
+      try await waitForConfirmSlot()
     }
 
+    if confirmMode {
+      await acquirePublishGate()
+      // The channel may have closed while this publish waited its turn.
+      guard isOpen else {
+        releasePublishGate()
+        throw ConnectionError.notConnected
+      }
+    }
     let seqNo = confirmMode ? nextPublishSeqNo : 0
 
     let frames = buildPublishFrames(
@@ -497,10 +546,18 @@ public actor Channel {
       frameMax: await connection.frameMax
     )
 
-    try await connection.writeBatch(frames)
+    do {
+      try await connection.writeBatch(frames)
+    } catch {
+      if confirmMode {
+        releasePublishGate()
+      }
+      throw error
+    }
 
     if confirmMode {
       nextPublishSeqNo += 1
+      releasePublishGate()
       if publisherConfirmationTracking {
         await connection.flush()
         try await awaitConfirmation(seqNo: seqNo)
@@ -508,17 +565,47 @@ public actor Channel {
     }
   }
 
-  private func waitForConfirmSlot() async {
+  private func waitForConfirmSlot() async throws {
     guard outstandingConfirmsLimit > 0 else { return }
     while outstandingConfirmsCount >= outstandingConfirmsLimit {
       await withCheckedContinuation { cont in
         confirmLimitWaiters.append(cont)
       }
+      // Woken by the channel going away rather than by a freed slot.
+      guard isOpen else {
+        throw ConnectionError.notConnected
+      }
     }
     outstandingConfirmsCount += 1
   }
 
+  /// Takes the publish gate, waiting behind every publish that asked first. A
+  /// releasing holder hands the gate straight to the first waiter, so
+  /// `publishGateHeld` stays true across the handoff.
+  private func acquirePublishGate() async {
+    guard publishGateHeld else {
+      publishGateHeld = true
+      return
+    }
+    await withCheckedContinuation { cont in
+      publishGateWaiters.append(cont)
+    }
+  }
+
+  private func releasePublishGate() {
+    guard !publishGateWaiters.isEmpty else {
+      publishGateHeld = false
+      return
+    }
+    publishGateWaiters.removeFirst().resume()
+  }
+
   private func awaitConfirmation(seqNo: UInt64) async throws {
+    // The channel may have closed, and drained its waiters, while this publish
+    // was still writing; a handler installed now would never be resumed.
+    guard isOpen else {
+      throw ConnectionError.notConnected
+    }
     let confirmed = try await withCheckedThrowingContinuation { cont in
       confirmHandlers[seqNo] = cont
     }
@@ -704,12 +791,18 @@ public actor Channel {
   /// - Parameter outstandingLimit: Maximum number of unconfirmed messages before publish
   ///   methods block. Only applies when `tracking` is `true`. Use `0` for unlimited.
   public func confirmSelect(tracking: Bool = false, outstandingLimit: Int = 0) async throws {
+    // The broker treats a repeated Confirm.Select as a no-op and keeps numbering
+    // deliveries where it was; restarting the sequence here would put every
+    // later publish one or more tags away from the answer meant for it. The
+    // second check covers callers that overlapped while the RPC was in flight.
+    guard !confirmMode else { return }
     let select = ConfirmSelect(noWait: false)
     try await sendMethod(.confirmSelect(select))
     let response = try await waitForResponse()
     guard case .confirmSelectOk = response else {
       throw ConnectionError.protocolError("Expected Confirm.SelectOk, got \(response)")
     }
+    guard !confirmMode else { return }
     confirmMode = true
     publisherConfirmationTracking = tracking
     outstandingConfirmsLimit = outstandingLimit
@@ -723,6 +816,13 @@ public actor Channel {
 
   public var publishSeqNo: UInt64 {
     nextPublishSeqNo
+  }
+
+  /// How many RPCs are parked for a broker reply. A stub-driven test answers a
+  /// request only once the channel is listening for the answer; a reply that
+  /// lands earlier is dropped.
+  internal var awaitingResponses: Int {
+    pendingResponses.count
   }
 
   /// Wait for all outstanding publisher confirmations to complete.
@@ -855,6 +955,7 @@ public actor Channel {
         cont.resume(throwing: error)
       }
       pendingGetResponses.removeAll()
+      failOutstandingConfirms(with: error)
       await connection?.channelClosed(channelID)
 
     case .basicDeliver(let deliver):
@@ -1009,6 +1110,17 @@ public actor Channel {
       cont.resume(throwing: error)
     }
     pendingGetResponses.removeAll()
+    isOpen = false
+    failOutstandingConfirms(with: error)
+    incomingMessage = nil
+  }
+
+  /// Fails every publish still waiting on the broker and wakes the publishers
+  /// parked on the outstanding-confirms limit so they observe the closed
+  /// channel. Every path that ends the channel's life calls this: a waiter
+  /// nobody resumes is destroyed unresumed and its publisher stays suspended
+  /// for the life of the process.
+  private func failOutstandingConfirms(with error: any Error) {
     for (_, cont) in confirmHandlers {
       cont.resume(throwing: error)
     }
@@ -1018,8 +1130,6 @@ public actor Channel {
     }
     confirmLimitWaiters.removeAll()
     outstandingConfirmsCount = 0
-    isOpen = false
-    incomingMessage = nil
   }
 
   /// Finish all consumer streams permanently. Called when
@@ -1208,6 +1318,13 @@ public actor Channel {
     consumers.removeAll()
 
     let close = ChannelClose(replyCode: 200, replyText: "Normal shutdown", classId: 0, methodId: 0)
+    failOutstandingConfirms(
+      with: ConnectionError.channelClosed(
+        replyCode: close.replyCode,
+        replyText: close.replyText,
+        classID: close.classId,
+        methodID: close.methodId
+      ))
     try await sendMethod(.channelClose(close))
     _ = try? await waitForResponse()
 
