@@ -40,8 +40,10 @@ public actor Channel {
   private var prefetchSize: UInt32 = 0
   private var prefetchGlobal: Bool = false
 
-  // Pending RPC responses
-  private var pendingResponses: [CheckedContinuation<AMQPMethod, Error>] = []
+  // Pending RPC responses, in request order. A slot is added before its request
+  // is written, so a reply that lands before the caller parks its continuation
+  // is kept for it instead of dropped (see `rpc`).
+  private var pendingResponses: [PendingResponse] = []
   private var pendingGetResponses: [CheckedContinuation<GetResponse?, Error>] = []
 
   // Message assembly
@@ -84,8 +86,7 @@ public actor Channel {
   }
 
   internal func open() async throws {
-    try await sendMethod(.channelOpen(ChannelOpen()))
-    let response = try await waitForResponse()
+    let response = try await rpc(.channelOpen(ChannelOpen()))
     guard case .channelOpenOk = response else {
       throw ConnectionError.protocolError("Expected Channel.OpenOk, got \(response)")
     }
@@ -113,8 +114,7 @@ public actor Channel {
       noWait: false,
       arguments: arguments
     )
-    try await sendMethod(.exchangeDeclare(declare))
-    let response = try await waitForResponse()
+    let response = try await rpc(.exchangeDeclare(declare))
     guard case .exchangeDeclareOk = response else {
       throw ConnectionError.protocolError("Expected Exchange.DeclareOk, got \(response)")
     }
@@ -167,8 +167,7 @@ public actor Channel {
       ifUnused: ifUnused,
       noWait: false
     )
-    try await sendMethod(.exchangeDelete(delete))
-    let response = try await waitForResponse()
+    let response = try await rpc(.exchangeDelete(delete))
     guard case .exchangeDeleteOk = response else {
       throw ConnectionError.protocolError("Expected Exchange.DeleteOk, got \(response)")
     }
@@ -208,8 +207,7 @@ public actor Channel {
       noWait: false,
       arguments: arguments
     )
-    try await sendMethod(.exchangeBind(bind))
-    let response = try await waitForResponse()
+    let response = try await rpc(.exchangeBind(bind))
     guard case .exchangeBindOk = response else {
       throw ConnectionError.protocolError("Expected Exchange.BindOk, got \(response)")
     }
@@ -229,8 +227,7 @@ public actor Channel {
       noWait: false,
       arguments: arguments
     )
-    try await sendMethod(.exchangeUnbind(unbind))
-    let response = try await waitForResponse()
+    let response = try await rpc(.exchangeUnbind(unbind))
     guard case .exchangeUnbindOk = response else {
       throw ConnectionError.protocolError("Expected Exchange.UnbindOk, got \(response)")
     }
@@ -275,8 +272,7 @@ public actor Channel {
       noWait: false,
       arguments: args
     )
-    try await sendMethod(.queueDeclare(declare))
-    let response = try await waitForResponse()
+    let response = try await rpc(.queueDeclare(declare))
     guard case .queueDeclareOk(let ok) = response else {
       throw ConnectionError.protocolError("Expected Queue.DeclareOk, got \(response)")
     }
@@ -358,8 +354,7 @@ public actor Channel {
       ifEmpty: ifEmpty,
       noWait: false
     )
-    try await sendMethod(.queueDelete(delete))
-    let response = try await waitForResponse()
+    let response = try await rpc(.queueDelete(delete))
     guard case .queueDeleteOk(let ok) = response else {
       throw ConnectionError.protocolError("Expected Queue.DeleteOk, got \(response)")
     }
@@ -371,8 +366,7 @@ public actor Channel {
 
   public func queuePurge(_ name: String) async throws -> UInt32 {
     let purge = QueuePurge(reserved1: 0, queue: name, noWait: false)
-    try await sendMethod(.queuePurge(purge))
-    let response = try await waitForResponse()
+    let response = try await rpc(.queuePurge(purge))
     guard case .queuePurgeOk(let ok) = response else {
       throw ConnectionError.protocolError("Expected Queue.PurgeOk, got \(response)")
     }
@@ -411,8 +405,7 @@ public actor Channel {
       noWait: false,
       arguments: arguments
     )
-    try await sendMethod(.queueBind(bind))
-    let response = try await waitForResponse()
+    let response = try await rpc(.queueBind(bind))
     guard case .queueBindOk = response else {
       throw ConnectionError.protocolError("Expected Queue.BindOk, got \(response)")
     }
@@ -431,8 +424,7 @@ public actor Channel {
       routingKey: routingKey,
       arguments: arguments
     )
-    try await sendMethod(.queueUnbind(unbind))
-    let response = try await waitForResponse()
+    let response = try await rpc(.queueUnbind(unbind))
     guard case .queueUnbindOk = response else {
       throw ConnectionError.protocolError("Expected Queue.UnbindOk, got \(response)")
     }
@@ -687,8 +679,7 @@ public actor Channel {
       noWait: false,
       arguments: arguments
     )
-    try await sendMethod(.basicConsume(consume))
-    let response = try await waitForResponse()
+    let response = try await rpc(.basicConsume(consume))
     guard case .basicConsumeOk(let ok) = response else {
       throw ConnectionError.protocolError("Expected Basic.ConsumeOk, got \(response)")
     }
@@ -710,8 +701,7 @@ public actor Channel {
 
   public func basicCancel(_ consumerTag: String) async throws {
     let cancel = BasicCancel(consumerTag: consumerTag, noWait: false)
-    try await sendMethod(.basicCancel(cancel))
-    let response = try await waitForResponse()
+    let response = try await rpc(.basicCancel(cancel))
     guard case .basicCancelOk = response else {
       throw ConnectionError.protocolError("Expected Basic.CancelOk, got \(response)")
     }
@@ -771,8 +761,7 @@ public actor Channel {
     async throws
   {
     let qos = BasicQos(prefetchSize: prefetchSize, prefetchCount: prefetchCount, global: global)
-    try await sendMethod(.basicQos(qos))
-    let response = try await waitForResponse()
+    let response = try await rpc(.basicQos(qos))
     guard case .basicQosOk = response else {
       throw ConnectionError.protocolError("Expected Basic.QosOk, got \(response)")
     }
@@ -797,8 +786,7 @@ public actor Channel {
     // second check covers callers that overlapped while the RPC was in flight.
     guard !confirmMode else { return }
     let select = ConfirmSelect(noWait: false)
-    try await sendMethod(.confirmSelect(select))
-    let response = try await waitForResponse()
+    let response = try await rpc(.confirmSelect(select))
     guard case .confirmSelectOk = response else {
       throw ConnectionError.protocolError("Expected Confirm.SelectOk, got \(response)")
     }
@@ -822,7 +810,7 @@ public actor Channel {
   /// request only once the channel is listening for the answer; a reply that
   /// lands earlier is dropped.
   internal var awaitingResponses: Int {
-    pendingResponses.count
+    pendingResponses.filter(\.requestSent).count
   }
 
   /// Wait for all outstanding publisher confirmations to complete.
@@ -836,8 +824,7 @@ public actor Channel {
   // MARK: - Transactions
 
   public func txSelect() async throws {
-    try await sendMethod(.txSelect)
-    let response = try await waitForResponse()
+    let response = try await rpc(.txSelect)
     guard case .txSelectOk = response else {
       throw ConnectionError.protocolError("Expected Tx.SelectOk, got \(response)")
     }
@@ -845,16 +832,14 @@ public actor Channel {
   }
 
   public func txCommit() async throws {
-    try await sendMethod(.txCommit)
-    let response = try await waitForResponse()
+    let response = try await rpc(.txCommit)
     guard case .txCommitOk = response else {
       throw ConnectionError.protocolError("Expected Tx.CommitOk, got \(response)")
     }
   }
 
   public func txRollback() async throws {
-    try await sendMethod(.txRollback)
-    let response = try await waitForResponse()
+    let response = try await rpc(.txRollback)
     guard case .txRollbackOk = response else {
       throw ConnectionError.protocolError("Expected Tx.RollbackOk, got \(response)")
     }
@@ -923,9 +908,8 @@ public actor Channel {
       .basicQosOk, .basicConsumeOk, .basicCancelOk, .basicRecoverOk,
       .txSelectOk, .txCommitOk, .txRollbackOk,
       .confirmSelectOk:
-      if let cont = pendingResponses.first {
-        pendingResponses.removeFirst()
-        cont.resume(returning: method)
+      if !pendingResponses.isEmpty {
+        pendingResponses.removeFirst().settle(.success(method))
       }
 
     case .channelClose(let close):
@@ -947,8 +931,8 @@ public actor Channel {
       for handler in closeHandlers {
         handler(closeInfo)
       }
-      for cont in pendingResponses {
-        cont.resume(throwing: error)
+      for pending in pendingResponses {
+        pending.settle(.failure(error))
       }
       pendingResponses.removeAll()
       for cont in pendingGetResponses {
@@ -1102,8 +1086,8 @@ public actor Channel {
   /// resume transparently after recovery.
   internal func handleConnectionLost() {
     let error = ConnectionError.notConnected
-    for cont in pendingResponses {
-      cont.resume(throwing: error)
+    for pending in pendingResponses {
+      pending.settle(.failure(error))
     }
     pendingResponses.removeAll()
     for cont in pendingGetResponses {
@@ -1144,7 +1128,7 @@ public actor Channel {
   internal func recoverOnNewConnection() async throws {
     // Clear any pending state from a previous failed recovery attempt
     let error = ConnectionError.notConnected
-    for cont in pendingResponses { cont.resume(throwing: error) }
+    for pending in pendingResponses { pending.settle(.failure(error)) }
     pendingResponses.removeAll()
     for cont in pendingGetResponses { cont.resume(throwing: error) }
     pendingGetResponses.removeAll()
@@ -1155,8 +1139,7 @@ public actor Channel {
     if prefetchCount > 0 || prefetchSize > 0 {
       let qos = BasicQos(
         prefetchSize: prefetchSize, prefetchCount: prefetchCount, global: prefetchGlobal)
-      try await sendMethod(.basicQos(qos))
-      let response = try await waitForResponse()
+      let response = try await rpc(.basicQos(qos))
       guard case .basicQosOk = response else {
         throw ConnectionError.protocolError("Expected Basic.QosOk during recovery")
       }
@@ -1165,8 +1148,7 @@ public actor Channel {
     // Restore publisher confirms
     if confirmMode {
       let select = ConfirmSelect(noWait: false)
-      try await sendMethod(.confirmSelect(select))
-      let response = try await waitForResponse()
+      let response = try await rpc(.confirmSelect(select))
       guard case .confirmSelectOk = response else {
         throw ConnectionError.protocolError("Expected Confirm.SelectOk during recovery")
       }
@@ -1175,8 +1157,7 @@ public actor Channel {
 
     // Restore transaction mode
     if transactionMode {
-      try await sendMethod(.txSelect)
-      let response = try await waitForResponse()
+      let response = try await rpc(.txSelect)
       guard case .txSelectOk = response else {
         throw ConnectionError.protocolError("Expected Tx.SelectOk during recovery")
       }
@@ -1195,8 +1176,7 @@ public actor Channel {
       noWait: false,
       arguments: exchange.arguments
     )
-    try await sendMethod(.exchangeDeclare(declare))
-    let response = try await waitForResponse()
+    let response = try await rpc(.exchangeDeclare(declare))
     guard case .exchangeDeclareOk = response else {
       throw ConnectionError.protocolError("Expected Exchange.DeclareOk during recovery")
     }
@@ -1214,8 +1194,7 @@ public actor Channel {
       noWait: false,
       arguments: queue.arguments
     )
-    try await sendMethod(.queueDeclare(declare))
-    let response = try await waitForResponse()
+    let response = try await rpc(.queueDeclare(declare))
     guard case .queueDeclareOk(let ok) = response else {
       throw ConnectionError.protocolError("Expected Queue.DeclareOk during recovery")
     }
@@ -1256,8 +1235,7 @@ public actor Channel {
     )
 
     do {
-      try await sendMethod(.basicConsume(consume))
-      let response = try await waitForResponse()
+      let response = try await rpc(.basicConsume(consume))
       guard case .basicConsumeOk(let ok) = response else { return nil }
 
       if ok.consumerTag != recorded.consumerTag {
@@ -1300,9 +1278,38 @@ public actor Channel {
     try await connection.send(.method(channelID: channelID, method: method))
   }
 
-  private func waitForResponse() async throws -> AMQPMethod {
-    try await withCheckedThrowingContinuation { cont in
-      pendingResponses.append(cont)
+  /// Sends `method` and returns the broker's reply.
+  ///
+  /// The response slot is queued before the request is written. The reply
+  /// travels back through the transport and `Connection` as its own job, and
+  /// nothing orders that job after this caller's resumption from `send`: with
+  /// the slot queued afterwards, a reply that won the race found nothing to
+  /// resume, was dropped, and the caller then parked forever on a continuation
+  /// nothing would complete. The slot keeps an early reply until the caller
+  /// parks. A `send` that throws has written nothing, so no reply follows and
+  /// the slot is removed — unless a close or connection loss already settled
+  /// it, in which case it has left the queue already.
+  private func rpc(_ method: AMQPMethod) async throws -> AMQPMethod {
+    guard let connection = connection else {
+      throw ConnectionError.notConnected
+    }
+    let pending = PendingResponse()
+    pendingResponses.append(pending)
+    do {
+      try await connection.send(.method(channelID: channelID, method: method))
+    } catch {
+      if let index = pendingResponses.firstIndex(where: { $0 === pending }) {
+        pendingResponses.remove(at: index)
+      }
+      throw error
+    }
+    pending.requestSent = true
+    return try await withCheckedThrowingContinuation { cont in
+      if let outcome = pending.outcome {
+        cont.resume(with: outcome)
+      } else {
+        pending.continuation = cont
+      }
     }
   }
 
@@ -1325,8 +1332,7 @@ public actor Channel {
         classID: close.classId,
         methodID: close.methodId
       ))
-    try await sendMethod(.channelClose(close))
-    _ = try? await waitForResponse()
+    _ = try? await rpc(.channelClose(close))
 
     await connection?.channelClosed(channelID)
   }
@@ -1335,6 +1341,25 @@ public actor Channel {
 
   public var open: Bool { isOpen }
   public var number: UInt16 { channelID }
+}
+
+/// One in-flight channel RPC, confined to the channel actor. The reply, or the
+/// error that ends the wait, goes to the parked continuation, or is held until
+/// the caller parks when it arrives first.
+private final class PendingResponse {
+  var continuation: CheckedContinuation<AMQPMethod, Error>?
+  var outcome: Result<AMQPMethod, Error>?
+  /// Set once the request has been written; tests answer only sent requests.
+  var requestSent = false
+
+  func settle(_ result: Result<AMQPMethod, Error>) {
+    if let continuation {
+      self.continuation = nil
+      continuation.resume(with: result)
+    } else if outcome == nil {
+      outcome = result
+    }
+  }
 }
 
 // MARK: - Supporting Types
