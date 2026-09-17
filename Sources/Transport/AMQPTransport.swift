@@ -371,7 +371,10 @@ public actor AMQPTransport {
           await handler(frame)
         }
       }
-      // Frame stream ended: the connection was lost
+      // Frame stream ended: the connection was lost. A dispatcher that
+      // `resetForRecovery` cancelled is reporting the previous socket's end,
+      // which the next attempt's socket must not be charged with.
+      if Task.isCancelled { return }
       if let self = self, let onDisconnect = await self.onDisconnect {
         await self.markDisconnected()
         await onDisconnect()

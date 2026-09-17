@@ -257,9 +257,19 @@ public actor Connection {
   /// Called when the frame dispatcher terminates unexpectedly (network failure, heartbeat timeout).
   private func handleDisconnection() async {
     guard !closedByClient else { return }
-    guard !recovering else { return }
 
     isOpen = false
+
+    if recovering {
+      // The socket the running recovery just brought up went away again.
+      // Fail the RPCs and confirm waits in flight on it so that recovery's
+      // current attempt throws and its loop retries; it is still the one
+      // recovery in progress, so no second one is started.
+      for channel in channels.values {
+        await channel.handleConnectionLost()
+      }
+      return
+    }
 
     // Notify all channels that the connection is lost so pending operations fail
     for channel in channels.values {

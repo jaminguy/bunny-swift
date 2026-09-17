@@ -1147,12 +1147,25 @@ public actor Channel {
   }
 
   internal func recoverOnNewConnection() async throws {
-    // Clear any pending state from a previous failed recovery attempt
+    // The publish gate is held from before the channel re-opens until confirm
+    // mode is re-selected and the sequence reset. `open()` marks the channel
+    // open, so without the gate a publish admitted in between is numbered
+    // from the old sequence and written on a channel whose deliveries the
+    // broker counts from 1: no ack ever names its slot, and every later
+    // publish is off by one. With the gate held it waits and goes out on the
+    // fresh sequence.
+    await acquirePublishGate()
+    defer { releasePublishGate() }
+
+    // Clear any pending state from a previous failed recovery attempt,
+    // including confirm slots of publishes written on a channel that was
+    // lost while recovery was already running: nothing else fails them.
     let error = ConnectionError.notConnected
     for pending in pendingResponses { pending.settle(.failure(error)) }
     pendingResponses.removeAll()
     for cont in pendingGetResponses { cont.resume(throwing: error) }
     pendingGetResponses.removeAll()
+    failOutstandingConfirms(with: error)
 
     try await open()
 
