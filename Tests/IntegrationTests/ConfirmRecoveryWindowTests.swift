@@ -85,6 +85,57 @@ private func closeAllConnectionsWithName(
   }
 }
 
+/// Creates a broker user for one probe, runs the body, and deletes the user
+/// before returning, on success and on failure alike. The deletion is
+/// awaited: an unstructured task spawned at exit can be outlived by the test
+/// process, and a leftover user is a footprint on whatever broker ran the
+/// suite.
+private func withProbeUser(
+  prefix: String, _ body: (String) async throws -> Void
+) async throws {
+  let user = "\(prefix).\(UUID().uuidString.prefix(8))"
+  try await httpAPI.createUser(.withPassword(user, password: user))
+  try await httpAPI.grantPermissions(
+    PermissionParams(user: user, vhost: "/", configure: ".*", write: ".*", read: ".*"))
+  do {
+    try await body(user)
+  } catch {
+    try? await httpAPI.deleteUser(user, idempotently: true)
+    throw error
+  }
+  try await httpAPI.deleteUser(user, idempotently: true)
+}
+
+private func openProbeConnection(user: String) async throws -> Connection {
+  var config = ConnectionConfiguration(
+    automaticRecovery: true,
+    networkRecoveryInterval: WindowTestConfig.recoveryInterval,
+    topologyRecovery: true
+  )
+  config.username = user
+  config.password = user
+  config.heartbeat = 4
+  config.connectionName = user
+  return try await Connection.open(config)
+}
+
+/// Publishes once on a recovered channel and reports whether the broker
+/// confirmed it within the deadline. A publish that throws counts as not
+/// confirmed: a dead channel fails fast, and "settled" alone would accept it.
+private func freshPublishConfirmed(on channel: Channel, timeout: TimeInterval = 5) async -> Bool {
+  let result = NIOLockedValueBox<Bool?>(nil)
+  Task {
+    do {
+      try await channel.basicPublish(body: Data("after".utf8), routingKey: unroutedKey)
+      result.withLockedValue { $0 = true }
+    } catch {
+      result.withLockedValue { $0 = false }
+    }
+  }
+  _ = await pollUntil(timeout: timeout) { result.withLockedValue { $0 } != nil }
+  return result.withLockedValue { $0 } == true
+}
+
 private enum WindowTestError: Error, CustomStringConvertible {
   case connectionNotFound(String)
 
@@ -158,15 +209,12 @@ struct ConfirmRecoveryWindowTests {
       "\(loops.startedCount - loops.settledCount) publish(es) never settled after recovery (started \(loops.startedCount), settled \(loops.settledCount))"
     )
 
-    // A fresh publish on the recovered channel must settle: it proves the
-    // client's sequence still matches the broker's delivery tags.
-    let fresh = NIOLockedValueBox(false)
-    Task {
-      _ = try? await channel.basicPublish(body: Data("after".utf8), routingKey: unroutedKey)
-      fresh.withLockedValue { $0 = true }
-    }
-    #expect(await pollUntil(timeout: 5) { fresh.withLockedValue { $0 } }, "a publish after recovery never settled")
-    if drained { try? await connection.close() }
+    // A fresh publish on the recovered channel must be confirmed: it proves
+    // the client's sequence still matches the broker's delivery tags and
+    // that the channel is alive, not failing fast.
+    let confirmed = await freshPublishConfirmed(on: channel)
+    #expect(confirmed, "a publish after recovery was not confirmed")
+    if drained && confirmed { try? await connection.close() }
   }
 
   @Test("Recovery survives a second forced close that lands while channels are recovering", .timeLimit(.minutes(3)))
@@ -175,22 +223,13 @@ struct ConfirmRecoveryWindowTests {
     // broker can close it through connection tracking — immediate, unlike the
     // management listing, which lags creation by seconds — without touching
     // any other suite's connections.
-    let user = "test.second.drop.\(UUID().uuidString.prefix(8))"
-    try await httpAPI.createUser(.withPassword(user, password: user))
-    try await httpAPI.grantPermissions(
-      PermissionParams(user: user, vhost: "/", configure: ".*", write: ".*", read: ".*"))
-    defer { Task { try? await httpAPI.deleteUser(user, idempotently: true) } }
+    try await withProbeUser(prefix: "test.second.drop") { user in
+      try await secondCloseInsideChannelRecovery(user: user)
+    }
+  }
 
-    var config = ConnectionConfiguration(
-      automaticRecovery: true,
-      networkRecoveryInterval: WindowTestConfig.recoveryInterval,
-      topologyRecovery: true
-    )
-    config.username = user
-    config.password = user
-    config.heartbeat = 4
-    config.connectionName = user
-    let connection = try await Connection.open(config)
+  private func secondCloseInsideChannelRecovery(user: String) async throws {
+    let connection = try await openProbeConnection(user: user)
     // Enough confirm-mode channels to make channel recovery outlast the
     // tracked close's round trip, and no more: every channel here is two
     // RPCs per recovery on a broker the other suites are using at the same
@@ -207,42 +246,131 @@ struct ConfirmRecoveryWindowTests {
     let loops = PublisherLoops()
     loops.run(count: 4, on: channels[0])
 
-    try await httpAPI.closeUserConnections(user, reason: "Closed by a test via the HTTP API (first drop)")
-    #expect(await pollUntil(timeout: 5) { await !connection.connected }, "the first forced close was not detected")
     // `connected` flips back the moment the socket is up, before channel
     // recovery starts; the second close is issued at that moment and lands
     // while the channels are being recovered. It counts as inside the window
-    // when no recovery had completed by the time it was issued.
-    #expect(
-      await pollUntil(timeout: WindowTestConfig.recoveryTimeout, interval: 0.005) { await connection.connected },
-      "the connection did not reconnect")
-    try await httpAPI.closeUserConnections(user, reason: "Closed by a test via the HTTP API (second drop)")
-    let landedInsideTheWindow = recoveries.withLockedValue { $0 } == 0
+    // when no recovery had completed by the time it was issued. A close that
+    // misses the window (recovery already finished) exercises nothing this
+    // test is for, so the drop is repeated until one lands; a run in which
+    // none lands is a failure, not a pass.
+    var landedInsideTheWindow = false
+    var attempts = 0
+    while !landedInsideTheWindow && attempts < 3 {
+      attempts += 1
+      let recoveriesBefore = recoveries.withLockedValue { $0 }
+      try await httpAPI.closeUserConnections(user, reason: "Closed by a test via the HTTP API (first drop, attempt \(attempts))")
+      #expect(await pollUntil(timeout: 5) { await !connection.connected }, "the forced close was not detected")
+      #expect(
+        await pollUntil(timeout: WindowTestConfig.recoveryTimeout, interval: 0.005) { await connection.connected },
+        "the connection did not reconnect")
+      try await httpAPI.closeUserConnections(user, reason: "Closed by a test via the HTTP API (second drop, attempt \(attempts))")
+      landedInsideTheWindow = recoveries.withLockedValue { $0 } == recoveriesBefore
+      if !landedInsideTheWindow {
+        // Let this attempt's second recovery finish before trying again.
+        _ = await pollUntil(timeout: WindowTestConfig.recoveryTimeout) {
+          recoveries.withLockedValue { $0 } >= recoveriesBefore + 2
+        }
+      }
+    }
+    #expect(landedInsideTheWindow, "the second close never landed inside channel recovery in \(attempts) attempts; the wedge window was not exercised")
+    guard landedInsideTheWindow else {
+      loops.stop()
+      try? await connection.close()
+      return
+    }
 
-    // Whether or not the close landed inside the window, the connection must
-    // end up recovered with live channels and every publish settled.
+    // The close landed while channels were recovering: the connection must
+    // still end up recovered with live channels and every publish settled.
+    let recoveriesAtLanding = recoveries.withLockedValue { $0 }
     let recoveredAgain = await pollUntil(timeout: WindowTestConfig.recoveryTimeout) {
-      recoveries.withLockedValue { $0 } >= (landedInsideTheWindow ? 1 : 2)
+      recoveries.withLockedValue { $0 } > recoveriesAtLanding
     }
     #expect(
       recoveredAgain,
-      "recovery never completed after the second close (landed inside the window: \(landedInsideTheWindow), recoveries: \(recoveries.withLockedValue { $0 }))"
+      "recovery never completed after a second close inside channel recovery (recoveries: \(recoveries.withLockedValue { $0 }))"
     )
     loops.stop()
     let drained = await pollUntil(timeout: 10) { loops.settledCount == loops.startedCount }
-    #expect(
-      drained,
-      "\(loops.startedCount - loops.settledCount) publish(es) never settled (landed inside the window: \(landedInsideTheWindow))"
-    )
-    let fresh = NIOLockedValueBox(false)
-    Task {
-      _ = try? await channels[0].basicPublish(body: Data("after".utf8), routingKey: unroutedKey)
-      fresh.withLockedValue { $0 = true }
+    #expect(drained, "\(loops.startedCount - loops.settledCount) publish(es) never settled after the second close")
+    let confirmed = await freshPublishConfirmed(on: channels[0])
+    #expect(confirmed, "a publish after the second close was not confirmed: the channel is dead or misnumbered")
+    if recoveredAgain && drained && confirmed { try? await connection.close() }
+  }
+
+  /// The second close lands after every channel is back but while the
+  /// topology is still being redeclared. Topology recovery swallows RPC
+  /// errors, so a recovery that loses its socket there must still notice
+  /// and try again rather than report success on a dead connection.
+  @Test("Recovery survives a second forced close that lands while the topology is being recovered", .timeLimit(.minutes(3)))
+  func recoverySurvivesASecondCloseDuringTopologyRecovery() async throws {
+    try await withProbeUser(prefix: "test.topology.drop") { user in
+      try await secondCloseDuringTopologyRecovery(user: user)
     }
-    #expect(await pollUntil(timeout: 5) { fresh.withLockedValue { $0 } }, "a publish after the second close never settled")
-    if !landedInsideTheWindow {
-      Issue.record("probe note: the second close landed after channel recovery had completed; the wedge window was not exercised this run", severity: .warning)
+  }
+
+  private func secondCloseDuringTopologyRecovery(user: String) async throws {
+    let connection = try await openProbeConnection(user: user)
+    let channel = try await connection.openChannel()
+    try await channel.confirmSelect(tracking: true)
+    // One channel, so channel recovery is instant, and enough recorded
+    // queues that redeclaring them outlasts the close's round trip.
+    let prefix = "bunnyswift.recovery.topology.\(UUID().uuidString.prefix(8))"
+    for index in 0..<400 {
+      _ = try await channel.queue("\(prefix).\(index)", durable: true)
     }
-    if recoveredAgain && drained { try? await connection.close() }
+    defer {
+      Task {
+        for index in 0..<400 { try? await httpAPI.deleteQueue("\(prefix).\(index)", in: "/", idempotently: true) }
+      }
+    }
+    let recoveries = NIOLockedValueBox(0)
+    await connection.onRecovery { recoveries.withLockedValue { $0 += 1 } }
+
+    let loops = PublisherLoops()
+    loops.run(count: 4, on: channel)
+
+    var landedInsideTopologyRecovery = false
+    var attempts = 0
+    while !landedInsideTopologyRecovery && attempts < 3 {
+      attempts += 1
+      let recoveriesBefore = recoveries.withLockedValue { $0 }
+      try await httpAPI.closeUserConnections(user, reason: "Closed by a test via the HTTP API (first drop, attempt \(attempts))")
+      #expect(await pollUntil(timeout: 5) { await !connection.connected }, "the forced close was not detected")
+      #expect(
+        await pollUntil(timeout: WindowTestConfig.recoveryTimeout, interval: 0.005) { await connection.connected },
+        "the connection did not reconnect")
+      // The single channel is back within a round trip of the reconnect;
+      // the redeclares are what the close is meant to interrupt.
+      try await httpAPI.closeUserConnections(user, reason: "Closed by a test via the HTTP API (second drop, attempt \(attempts))")
+      landedInsideTopologyRecovery = recoveries.withLockedValue { $0 } == recoveriesBefore
+      if !landedInsideTopologyRecovery {
+        _ = await pollUntil(timeout: WindowTestConfig.recoveryTimeout) {
+          recoveries.withLockedValue { $0 } >= recoveriesBefore + 2
+        }
+      }
+    }
+    #expect(landedInsideTopologyRecovery, "the second close never landed inside recovery in \(attempts) attempts")
+    guard landedInsideTopologyRecovery else {
+      loops.stop()
+      try? await connection.close()
+      return
+    }
+
+    // A recovery that lost its socket must not be reported as success: when
+    // `onRecovery` fires, the connection must actually be open, and publishes
+    // must settle on it.
+    let recoveriesAtLanding = recoveries.withLockedValue { $0 }
+    let recoveredAgain = await pollUntil(timeout: WindowTestConfig.recoveryTimeout) {
+      recoveries.withLockedValue { $0 } > recoveriesAtLanding
+    }
+    #expect(recoveredAgain, "recovery never completed after a second close during topology recovery")
+    let openAfterRecovery = await pollUntil(timeout: WindowTestConfig.recoveryTimeout) { await connection.connected }
+    #expect(openAfterRecovery, "recovery reported success on a connection that is not open")
+    loops.stop()
+    let drained = await pollUntil(timeout: 10) { loops.settledCount == loops.startedCount }
+    #expect(drained, "\(loops.startedCount - loops.settledCount) publish(es) never settled after the second close")
+    let confirmed = await freshPublishConfirmed(on: channel)
+    #expect(confirmed, "a publish after the second close was not confirmed: the channel is dead or misnumbered")
+    if recoveredAgain && openAfterRecovery && drained && confirmed { try? await connection.close() }
   }
 }

@@ -262,9 +262,10 @@ public actor Connection {
 
     if recovering {
       // The socket the running recovery just brought up went away again.
-      // Fail the RPCs and confirm waits in flight on it so that recovery's
-      // current attempt throws and its loop retries; it is still the one
-      // recovery in progress, so no second one is started.
+      // Fail the RPCs and confirm waits in flight on it; the running
+      // attempt sees the failure (a channel RPC throws, or the `isOpen`
+      // check after topology recovery) and its loop retries. It is still
+      // the one recovery in progress, so no second one is started.
       for channel in channels.values {
         await channel.handleConnectionLost()
       }
@@ -333,6 +334,14 @@ public actor Connection {
 
         if configuration.topologyRecovery {
           await recoverTopology()
+        }
+
+        // Topology recovery swallows its RPC errors, so a socket lost while
+        // it ran would otherwise be reported as a completed recovery on a
+        // dead connection. `handleDisconnection` cleared `isOpen` when the
+        // loss arrived; treat that as this attempt failing.
+        guard isOpen else {
+          throw ConnectionError.notConnected
         }
 
         for (_, channel) in channels {
