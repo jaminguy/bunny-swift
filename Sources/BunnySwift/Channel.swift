@@ -61,7 +61,10 @@ public actor Channel {
 
   // Publisher confirms
   private var nextPublishSeqNo: UInt64 = 1
-  private var confirmHandlers: [UInt64: CheckedContinuation<Bool, Error>] = [:]
+  /// One slot per in-flight confirm-mode publish, keyed by sequence number
+  /// and created before the frames are written, so an ack that lands before
+  /// the publisher parks its waiter is kept for it (see `awaitConfirmation`).
+  private var confirmHandlers: [UInt64: PendingConfirm] = [:]
   private var publisherConfirmationTracking = false
   private var outstandingConfirmsLimit: Int = 0
   private var outstandingConfirmsCount: Int = 0
@@ -469,6 +472,7 @@ public actor Channel {
       }
     }
     let seqNo = confirmMode ? nextPublishSeqNo : 0
+    let pending = registerConfirmSlot(seqNo: seqNo)
 
     let frames = buildPublishFrames(
       body: body,
@@ -484,6 +488,7 @@ public actor Channel {
       try await connection.writeBatch(frames)
     } catch {
       if confirmMode {
+        confirmHandlers.removeValue(forKey: seqNo)
         releasePublishGate()
       }
       throw error
@@ -493,8 +498,8 @@ public actor Channel {
     if confirmMode {
       nextPublishSeqNo += 1
       releasePublishGate()
-      if publisherConfirmationTracking {
-        try await awaitConfirmation(seqNo: seqNo)
+      if let pending {
+        try await awaitConfirmation(pending, seqNo: seqNo)
       }
     }
   }
@@ -527,6 +532,7 @@ public actor Channel {
       }
     }
     let seqNo = confirmMode ? nextPublishSeqNo : 0
+    let pending = registerConfirmSlot(seqNo: seqNo)
 
     let frames = buildPublishFrames(
       body: body,
@@ -542,6 +548,7 @@ public actor Channel {
       try await connection.writeBatch(frames)
     } catch {
       if confirmMode {
+        confirmHandlers.removeValue(forKey: seqNo)
         releasePublishGate()
       }
       throw error
@@ -550,9 +557,9 @@ public actor Channel {
     if confirmMode {
       nextPublishSeqNo += 1
       releasePublishGate()
-      if publisherConfirmationTracking {
+      if let pending {
         await connection.flush()
-        try await awaitConfirmation(seqNo: seqNo)
+        try await awaitConfirmation(pending, seqNo: seqNo)
       }
     }
   }
@@ -592,14 +599,31 @@ public actor Channel {
     publishGateWaiters.removeFirst().resume()
   }
 
-  private func awaitConfirmation(seqNo: UInt64) async throws {
-    // The channel may have closed, and drained its waiters, while this publish
-    // was still writing; a handler installed now would never be resumed.
-    guard isOpen else {
-      throw ConnectionError.notConnected
-    }
+  /// Registers the confirm slot for a tracked publish. Called under the
+  /// publish gate, in the same synchronous section that took `seqNo`, so the
+  /// slot exists before any frame is written: the broker's ack travels back
+  /// as its own job and nothing orders it after the publisher's resumption
+  /// from the write and flush hops. With the slot installed only in
+  /// `awaitConfirmation`, an ack that won that race found no waiter, was
+  /// dropped, and the publisher parked forever while its outstanding-confirms
+  /// slot stayed taken. Returns nil when nothing will await (no tracking).
+  private func registerConfirmSlot(seqNo: UInt64) -> PendingConfirm? {
+    guard confirmMode, publisherConfirmationTracking else { return nil }
+    let pending = PendingConfirm()
+    confirmHandlers[seqNo] = pending
+    return pending
+  }
+
+  private func awaitConfirmation(_ pending: PendingConfirm, seqNo: UInt64) async throws {
+    // A close or connection loss during the write has already settled the
+    // slot with its error, and an early ack has already settled it with the
+    // answer; either resumes here without parking.
     let confirmed = try await withCheckedThrowingContinuation { cont in
-      confirmHandlers[seqNo] = cont
+      if let outcome = pending.outcome {
+        cont.resume(with: outcome)
+      } else {
+        pending.continuation = cont
+      }
     }
     if !confirmed {
       throw ConnectionError.publisherNack(seqNo: seqNo)
@@ -1055,17 +1079,14 @@ public actor Channel {
   private func handleConfirm(deliveryTag: UInt64, multiple: Bool, ack: Bool) {
     var confirmedCount = 0
     if multiple {
-      var toResume: [(UInt64, CheckedContinuation<Bool, Error>)] = []
-      for (tag, cont) in confirmHandlers where tag <= deliveryTag {
-        toResume.append((tag, cont))
-      }
-      for (tag, cont) in toResume {
+      let matched = confirmHandlers.filter { $0.key <= deliveryTag }
+      for (tag, pending) in matched {
         confirmHandlers.removeValue(forKey: tag)
-        cont.resume(returning: ack)
+        pending.settle(.success(ack))
         confirmedCount += 1
       }
-    } else if let cont = confirmHandlers.removeValue(forKey: deliveryTag) {
-      cont.resume(returning: ack)
+    } else if let pending = confirmHandlers.removeValue(forKey: deliveryTag) {
+      pending.settle(.success(ack))
       confirmedCount += 1
     }
 
@@ -1105,8 +1126,8 @@ public actor Channel {
   /// nobody resumes is destroyed unresumed and its publisher stays suspended
   /// for the life of the process.
   private func failOutstandingConfirms(with error: any Error) {
-    for (_, cont) in confirmHandlers {
-      cont.resume(throwing: error)
+    for (_, pending) in confirmHandlers {
+      pending.settle(.failure(error))
     }
     confirmHandlers.removeAll()
     for waiter in confirmLimitWaiters {
@@ -1341,6 +1362,23 @@ public actor Channel {
 
   public var open: Bool { isOpen }
   public var number: UInt16 { channelID }
+}
+
+/// One in-flight tracked publish, confined to the channel actor. The broker's
+/// ack or nack, or the error that ends the wait, goes to the parked
+/// continuation, or is held until the publisher parks when it arrives first.
+private final class PendingConfirm {
+  var continuation: CheckedContinuation<Bool, Error>?
+  var outcome: Result<Bool, Error>?
+
+  func settle(_ result: Result<Bool, Error>) {
+    if let continuation {
+      self.continuation = nil
+      continuation.resume(with: result)
+    } else if outcome == nil {
+      outcome = result
+    }
+  }
 }
 
 /// One in-flight channel RPC, confined to the channel actor. The reply, or the
