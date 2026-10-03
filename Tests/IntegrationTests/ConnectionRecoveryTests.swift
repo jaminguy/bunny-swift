@@ -259,6 +259,55 @@ struct RecoveryIntegrationTests {
         await !connection.connected,
         "Connection should NOT recover when recovery is disabled")
     }
+
+    @Test("A client close while recovery is pending ends the recovery")
+    func closeDuringRecoveryEndsIt() async throws {
+      let name = "test.close.during.recovery.\(UUID().uuidString.prefix(8))"
+      var config = ConnectionConfiguration(
+        automaticRecovery: true,
+        networkRecoveryInterval: 1.0
+      )
+      config.heartbeat = 4
+      config.connectionName = name
+      let connection = try await Connection.open(config)
+      defer { Task { try? await connection.close() } }
+
+      let recovered = ManagedAtomic(false)
+      await connection.onRecovery { recovered.store(true) }
+      let channel = try await connection.openChannel()
+      let queue = try await channel.queue("", exclusive: true)
+      let stream = try await queue.consume()
+
+      try await closeAllConnectionsWithName(name)
+      let disconnected = await pollUntil(timeout: 5) { await !connection.connected }
+      #expect(disconnected, "Connection should detect forced close")
+
+      try await connection.close()
+      try await Task.sleep(for: .milliseconds(2500))
+
+      #expect(!recovered.load(), "recovery completed on a connection the client closed")
+      #expect(await !connection.connected)
+      let listed = try await httpAPI.listConnections().contains {
+        $0.clientProperties?.connectionName == name
+      }
+      #expect(!listed, "the broker still lists the closed connection")
+
+      // A closed connection ends its consumers rather than leaving them parked.
+      let finished = await withTaskGroup(of: Bool.self) { group in
+        group.addTask {
+          var iterator = stream.makeAsyncIterator()
+          return await iterator.next() == nil
+        }
+        group.addTask {
+          try? await Task.sleep(for: .seconds(2))
+          return false
+        }
+        let first = await group.next() ?? false
+        group.cancelAll()
+        return first
+      }
+      #expect(finished, "the consumer stream did not finish")
+    }
   }
 
   // MARK: - Channel State Recovery

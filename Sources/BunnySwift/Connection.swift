@@ -317,10 +317,15 @@ public actor Connection {
       } catch {
         return
       }
+      guard !closedByClient else { return }
 
       do {
         await transport.resetForRecovery()
         let params = try await connectToNextEndpoint()
+        guard !closedByClient else {
+          await transport.close()
+          return
+        }
         self.negotiatedParams = params
         self.isOpen = true
 
@@ -339,8 +344,9 @@ public actor Connection {
         // Topology recovery swallows its RPC errors, so a socket lost while
         // it ran would otherwise be reported as a completed recovery on a
         // dead connection. `handleDisconnection` cleared `isOpen` when the
-        // loss arrived; treat that as this attempt failing.
-        guard isOpen else {
+        // loss arrived; treat that as this attempt failing. A client close
+        // during the attempt has already torn the new socket down.
+        guard isOpen, !closedByClient else {
           throw ConnectionError.notConnected
         }
 
@@ -488,8 +494,17 @@ public actor Connection {
   // MARK: - Close
 
   public func close() async throws {
-    guard isOpen else { return }
+    // Set first: a close that lands while recovery is reconnecting finds the
+    // connection not open, and the recovery loop must still see it.
     closedByClient = true
+    guard isOpen else {
+      // `Channel.close` returns early on a channel that is not open, so the
+      // consumer streams are ended here.
+      for channel in channels.values {
+        await channel.terminateConsumers()
+      }
+      return
+    }
     isOpen = false
 
     for channel in channels.values {
