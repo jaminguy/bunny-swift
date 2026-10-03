@@ -877,7 +877,8 @@ public actor Channel {
 
   // MARK: - Channel Close Events
 
-  /// Register a handler for channel close events (server or client initiated).
+  /// Register a handler for a close the broker sends, such as a channel-level
+  /// error. It is not called for `close` or `Connection.close`.
   public func onClose(_ handler: @escaping @Sendable (ChannelCloseInfo) -> Void) {
     closeHandlers.append(handler)
   }
@@ -1017,9 +1018,9 @@ public actor Channel {
       handleConfirm(deliveryTag: nack.deliveryTag, multiple: nack.multiple, ack: false)
 
     case .basicCancel(let cancel):
+      // The broker's cancel is no-wait and has already forgotten the tag:
+      // a cancel-ok for it makes RabbitMQ close the connection with 541.
       removeConsumer(cancel.consumerTag)
-      let cancelOk = BasicCancelOk(consumerTag: cancel.consumerTag)
-      try? await sendMethod(.basicCancelOk(cancelOk))
 
       // An auto-delete queue's last consumer was cancelled by the server.
       // Remove the consumer from topology so it won't be recovered.
