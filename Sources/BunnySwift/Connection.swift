@@ -355,11 +355,18 @@ public actor Connection {
           // A channel's recovery handler may close the connection, and a
           // connection the client closed reports no recovery.
           guard !closedByClient else { return }
+          // The socket may also drop while a handler runs. The disconnection
+          // found this recovery running and left it to retry, so fail the
+          // attempt rather than report a recovery on a dead connection.
+          guard isOpen else { throw ConnectionError.notConnected }
         }
 
         for handler in onRecoveryHandlers {
           await handler()
         }
+        // The same loss during these handlers: they were told of a recovery
+        // that did not hold, so retry and tell them again when one does.
+        guard isOpen || closedByClient else { throw ConnectionError.notConnected }
         return
       } catch {
         attempt += 1

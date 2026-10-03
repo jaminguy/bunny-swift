@@ -141,6 +141,20 @@ private func closeAndWaitForRecovery(
   #expect(recovered, "Connection should recover after forced close")
 }
 
+/// Force-closes the connection's current socket and returns once the client
+/// has handled the loss: the disconnection has failed the channel, which it
+/// does only after the socket's frame stream ended. Returning on
+/// `!connection.connected` alone is too early, since the broker's
+/// connection.close clears that before the socket ends. Retries the close
+/// because the management listing can lag a fresh socket, or still list the
+/// one closed before it.
+private func dropSocketAndAwaitLoss(on channel: Channel, name: String) async -> Bool {
+  await pollUntil(timeout: 20, interval: 0.5) {
+    try? await closeAllConnectionsWithName(name, timeout: 1)
+    return await pollUntil(timeout: 1) { await !channel.open }
+  }
+}
+
 /// Verify that a queue is functional by publishing and checking message count.
 private func ensureQueueFunctional(
   channel: Channel,
@@ -331,6 +345,60 @@ struct RecoveryIntegrationTests {
 
       #expect(!recovered.load(), "recovery was reported on a connection the client closed")
       #expect(await !connection.connected)
+    }
+
+    @Test("A socket lost during a channel's recovery handler fails that attempt and recovery retries")
+    func socketLostInChannelRecoveryHandlerRetries() async throws {
+      let name = "test.drop.in.ch.recovery.handler.\(UUID().uuidString.prefix(8))"
+      let connection = try await RecoveryTestConfig.openConnection(name: name)
+      defer { Task { try? await connection.close() } }
+
+      let handlerRuns = ManagedAtomic(0)
+      let droppedInHandler = ManagedAtomic(false)
+      // The channel handler's run count at each recovery the connection reports.
+      let reports = ManagedAtomic<[Int]>([])
+      await connection.onRecovery { reports.store(reports.load() + [handlerRuns.load()]) }
+      let channel = try await connection.openChannel()
+      await channel.onRecovery {
+        let run = handlerRuns.load() + 1
+        handlerRuns.store(run)
+        guard run == 1 else { return }
+        droppedInHandler.store(await dropSocketAndAwaitLoss(on: channel, name: name))
+      }
+
+      try await closeAllConnectionsWithName(name)
+      let retried = await pollUntil(timeout: 30) { handlerRuns.load() >= 2 }
+      #expect(droppedInHandler.load(), "the socket was not lost inside the recovery handler")
+      #expect(retried, "no further recovery attempt started after the socket was lost")
+      let recovered = await pollUntil { await connection.connected && !reports.load().isEmpty }
+      #expect(recovered, "the connection did not recover")
+      #expect(
+        !reports.load().contains(1),
+        "recovery was reported for the attempt whose socket was lost")
+    }
+
+    @Test("A socket lost during a connection's recovery handler starts another recovery")
+    func socketLostInConnectionRecoveryHandlerRetries() async throws {
+      let name = "test.drop.in.conn.recovery.handler.\(UUID().uuidString.prefix(8))"
+      let connection = try await RecoveryTestConfig.openConnection(name: name)
+      defer { Task { try? await connection.close() } }
+
+      let channel = try await connection.openChannel()
+      let handlerRuns = ManagedAtomic(0)
+      let droppedInHandler = ManagedAtomic(false)
+      await connection.onRecovery {
+        let run = handlerRuns.load() + 1
+        handlerRuns.store(run)
+        guard run == 1 else { return }
+        droppedInHandler.store(await dropSocketAndAwaitLoss(on: channel, name: name))
+      }
+
+      try await closeAllConnectionsWithName(name)
+      let retried = await pollUntil(timeout: 30) { handlerRuns.load() >= 2 }
+      #expect(droppedInHandler.load(), "the socket was not lost inside the recovery handler")
+      #expect(retried, "no further recovery attempt started after the socket was lost")
+      let recovered = await pollUntil { await connection.connected }
+      #expect(recovered, "the connection did not recover")
     }
   }
 
