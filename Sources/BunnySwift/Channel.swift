@@ -893,7 +893,8 @@ public actor Channel {
 
   // MARK: - Channel Close Events
 
-  /// Register a handler for channel close events (server or client initiated).
+  /// Register a handler for a close the broker sends, such as a channel-level
+  /// error. It is not called for `close` or `Connection.close`.
   public func onClose(_ handler: @escaping @Sendable (ChannelCloseInfo) -> Void) {
     closeHandlers.append(handler)
   }
