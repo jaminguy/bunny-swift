@@ -74,4 +74,24 @@ struct ChannelSettleGuardTests {
     try await fresh.ack()
     #expect(await stub.sentAcks == [1])
   }
+
+  @Test("A re-open with no connection loss reported still retires the earlier tags")
+  func reopenAloneRetiresEarlierTags() async throws {
+    var (stub, channel, iterator, consumerTag) = try await consumingChannel()
+    await deliver(1, consumerTag: consumerTag, to: channel, channelID: channelID)
+    let stale = try #require(await iterator.next())
+
+    // A recovery retry replaces the socket under an open channel without a
+    // connection-lost callback, then re-opens the channel on the new one.
+    try await channel.recoverOnNewConnection()
+
+    await deliver(1, consumerTag: consumerTag, to: channel, channelID: channelID)
+    let fresh = try #require(await iterator.next())
+
+    await #expect(throws: ConnectionError.self) { try await stale.ack() }
+    #expect(await stub.sentAcks.isEmpty, "the stale ack went out on the re-opened channel")
+
+    try await fresh.ack()
+    #expect(await stub.sentAcks == [1])
+  }
 }

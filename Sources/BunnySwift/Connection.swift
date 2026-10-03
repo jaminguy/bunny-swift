@@ -352,6 +352,9 @@ public actor Connection {
 
         for (_, channel) in channels {
           await channel.notifyRecovered()
+          // A channel's recovery handler may close the connection, and a
+          // connection the client closed reports no recovery.
+          guard !closedByClient else { return }
         }
 
         for handler in onRecoveryHandlers {

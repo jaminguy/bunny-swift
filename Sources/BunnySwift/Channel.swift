@@ -52,8 +52,9 @@ public actor Channel {
   // Consumers
   private var consumers: [String: AsyncStream<Message>.Continuation] = [:]
 
-  /// Advances on every connection loss. Delivery tags are scoped to one broker
-  /// channel, and recovery re-opens this one with tags counting from 1 again,
+  /// Advances on every connection loss and every channel open, so a tag is
+  /// valid only for the channel incarnation that delivered it. Delivery tags
+  /// are scoped to one broker channel, and a re-open counts them from 1 again,
   /// so a tag from an earlier generation names nothing or a different message.
   private var deliveryGeneration: UInt64 = 0
   private var returnHandlers: [@Sendable (ReturnedMessage) -> Void] = []
@@ -94,6 +95,10 @@ public actor Channel {
   }
 
   internal func open() async throws {
+    // A new incarnation starts here. Advanced before channel.open goes out,
+    // so a tag from the previous one is refused even while the re-open is in
+    // flight. The broker delivers nothing on a channel before its open-ok.
+    deliveryGeneration += 1
     let response = try await rpc(.channelOpen(ChannelOpen()))
     guard case .channelOpenOk = response else {
       throw ConnectionError.protocolError("Expected Channel.OpenOk, got \(response)")

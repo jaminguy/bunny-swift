@@ -308,6 +308,30 @@ struct RecoveryIntegrationTests {
       }
       #expect(finished, "the consumer stream did not finish")
     }
+
+    @Test("A connection closed by a channel's recovery handler reports no recovery")
+    func closeFromChannelRecoveryHandlerReportsNoRecovery() async throws {
+      let name = "test.close.in.recovery.handler.\(UUID().uuidString.prefix(8))"
+      let connection = try await RecoveryTestConfig.openConnection(name: name)
+      defer { Task { try? await connection.close() } }
+
+      let recovered = ManagedAtomic(false)
+      let closedInHandler = ManagedAtomic(false)
+      await connection.onRecovery { recovered.store(true) }
+      let channel = try await connection.openChannel()
+      await channel.onRecovery {
+        try? await connection.close()
+        closedInHandler.store(true)
+      }
+
+      try await closeAllConnectionsWithName(name)
+      let closed = await pollUntil { closedInHandler.load() }
+      #expect(closed, "the channel recovery handler never ran")
+      try await Task.sleep(for: .milliseconds(500))
+
+      #expect(!recovered.load(), "recovery was reported on a connection the client closed")
+      #expect(await !connection.connected)
+    }
   }
 
   // MARK: - Channel State Recovery

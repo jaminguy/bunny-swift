@@ -62,7 +62,7 @@ private struct PipelineInitializer: @unchecked Sendable {
 public actor AMQPTransport {
   private let eventLoopGroup: EventLoopGroup
   private let ownsEventLoopGroup: Bool
-  private var channel: Channel?
+  internal private(set) var channel: Channel?
   private var frameStream: AsyncStream<Frame>?
   private var frameIterator: IteratorBox<Frame>?
   private var frameContinuation: AsyncStream<Frame>.Continuation?
@@ -104,6 +104,10 @@ public actor AMQPTransport {
     guard !isConnected else {
       throw ConnectionError.alreadyConnected
     }
+
+    // A close still waiting on the previous socket's reply is let go, so
+    // this connection starts with no waiter.
+    releaseCloseWaiter()
 
     // Apply write buffer configuration
     self.flushThreshold = configuration.writeBufferFlushThreshold
@@ -421,6 +425,9 @@ public actor AMQPTransport {
   /// Resets internal state.
   /// Must be called before calling `connect` or after a connection failure.
   public func resetForRecovery() async {
+    // The socket a waiting close is answered on is being dropped, and the
+    // dispatcher cancelled here never releases the wait.
+    releaseCloseWaiter()
     frameDispatchTask?.cancel()
     frameDispatchTask = nil
     scheduledFlush?.cancel()
@@ -459,23 +466,29 @@ public actor AMQPTransport {
     // an abrupt close. The dispatcher must keep running to see the reply: a
     // cancelled iterator finishes the frame stream. Without a dispatcher the
     // handshake never completed and there is nobody to close.
+    //
+    // The 1 s bound covers the write and the reply together: a peer that has
+    // stopped reading leaves the write pending for as long as it stays that
+    // way. The write is never awaited. Closing the socket below fails it if it
+    // is still pending; a write that fails because the socket died ends the
+    // frame stream, which releases the wait, and any other failure leaves the
+    // release to the bound.
     if frameDispatchTask != nil {
+      let bound = Task { [weak self] in
+        guard (try? await Task.sleep(for: .seconds(1))) != nil else { return }
+        await self?.releaseCloseWaiter()
+      }
       let close = ConnectionClose(replyCode: 200, replyText: "Normal shutdown")
       let frame = Frame.method(channelID: 0, method: .connectionClose(close))
-      if (try? await channel.writeAndFlush(frame).get()) != nil {
-        let bound = Task { [weak self] in
-          guard (try? await Task.sleep(for: .seconds(1))) != nil else { return }
-          await self?.releaseCloseWaiter()
+      channel.writeAndFlush(frame, promise: nil)
+      await withCheckedContinuation { continuation in
+        if closeWaitOver {
+          continuation.resume()
+        } else {
+          closeWaiter = continuation
         }
-        await withCheckedContinuation { continuation in
-          if closeWaitOver {
-            continuation.resume()
-          } else {
-            closeWaiter = continuation
-          }
-        }
-        bound.cancel()
       }
+      bound.cancel()
     }
     frameDispatchTask?.cancel()
     frameDispatchTask = nil
@@ -488,6 +501,8 @@ public actor AMQPTransport {
   }
 
   public func forceClose() async {
+    // The dispatcher cancelled here never releases a waiting close.
+    releaseCloseWaiter()
     isConnected = false
     scheduledFlush?.cancel()
     scheduledFlush = nil
