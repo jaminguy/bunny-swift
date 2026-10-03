@@ -1130,7 +1130,24 @@ public actor Channel {
   /// Consumer continuations are kept alive so `for await` loops
   /// resume transparently after recovery.
   internal func handleConnectionLost() {
-    let error = ConnectionError.notConnected
+    failPendingWork(with: ConnectionError.notConnected)
+    isOpen = false
+    deliveryGeneration += 1
+    incomingMessage = nil
+  }
+
+  /// Ends the channel for good when the client closes its connection: fails
+  /// every RPC, get and confirm still waiting, a recovery RPC included, and
+  /// finishes the consumer streams. Nothing answers or recovers the channel
+  /// after this, so anything left parked would never resume.
+  internal func failPendingAndFinish(_ error: any Error) {
+    failPendingWork(with: error)
+    isOpen = false
+    incomingMessage = nil
+    terminateConsumers()
+  }
+
+  private func failPendingWork(with error: any Error) {
     for pending in pendingResponses {
       pending.settle(.failure(error))
     }
@@ -1139,10 +1156,7 @@ public actor Channel {
       cont.resume(throwing: error)
     }
     pendingGetResponses.removeAll()
-    isOpen = false
-    deliveryGeneration += 1
     failOutstandingConfirms(with: error)
-    incomingMessage = nil
   }
 
   /// Fails every publish still waiting on the broker and wakes the publishers
@@ -1162,8 +1176,8 @@ public actor Channel {
     outstandingConfirmsCount = 0
   }
 
-  /// Finish all consumer streams permanently. Called when
-  /// recovery is disabled or all retry attempts are exhausted.
+  /// Finish all consumer streams permanently. Called when recovery is
+  /// disabled or all retry attempts are exhausted, and on a client close.
   internal func terminateConsumers() {
     for continuation in consumers.values {
       continuation.finish()

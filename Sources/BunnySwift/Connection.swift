@@ -12,7 +12,8 @@ import Recovery
 @_exported import Transport
 
 public actor Connection {
-  private var transport: AMQPTransport
+  /// Internal so a test can reach the socket's pipeline.
+  internal private(set) var transport: AMQPTransport
   private let configuration: ConnectionConfiguration
   private var negotiatedParams: NegotiatedParameters?
   private var channels: [UInt16: Channel] = [:]
@@ -510,19 +511,23 @@ public actor Connection {
     // Set first: a close that lands while recovery is reconnecting finds the
     // connection not open, and the recovery loop must still see it.
     closedByClient = true
-    guard isOpen else {
-      // `Channel.close` returns early on a channel that is not open, so the
-      // consumer streams are ended here.
-      for channel in channels.values {
-        await channel.terminateConsumers()
-      }
-      return
-    }
+    let wasOpen = isOpen
     isOpen = false
 
-    for channel in channels.values {
+    // Every channel is torn down the same way. An open one runs its close
+    // first; `Channel.close` returns early on one that is not open, which
+    // includes a channel recovery is re-opening. Then every channel has its
+    // pending work failed and its consumer streams ended: a recovery RPC waits
+    // on the socket this close discards, and a disconnection after a client
+    // close fails nothing, so it would never resume. Iterates a snapshot,
+    // because `Channel.close` removes the channel from `channels`. The work
+    // fails with `notConnected`, as any call made after the close does:
+    // `connectionClosed` reads as a server close and a hard error.
+    for channel in Array(channels.values) {
       try? await channel.close()
+      await channel.failPendingAndFinish(ConnectionError.notConnected)
     }
+    guard wasOpen else { return }
     channels.removeAll()
     await transport.close()
   }
