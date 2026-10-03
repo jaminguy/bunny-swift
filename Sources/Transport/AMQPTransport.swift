@@ -69,6 +69,12 @@ public actor AMQPTransport {
   private var frameHandler: (@Sendable (Frame) async -> Void)?
   private var frameDispatchTask: Task<Void, Never>?
   private var isConnected = false
+  /// Set only when the broker's `connection.close-ok` arrives.
+  internal private(set) var receivedCloseOk = false
+  /// `close` parks here until the broker answers its `connection.close`, the
+  /// frame stream ends, or the wait bound passes, whichever comes first.
+  private var closeWaiter: CheckedContinuation<Void, Never>?
+  private var closeWaitOver = false
   private var negotiatedParams: NegotiatedParameters?
   private let codec: FrameCodec
 
@@ -102,6 +108,8 @@ public actor AMQPTransport {
     // Apply write buffer configuration
     self.flushThreshold = configuration.writeBufferFlushThreshold
     self.flushInterval = configuration.writeBufferFlushInterval
+    self.receivedCloseOk = false
+    self.closeWaitOver = false
 
     let (stream, continuation) = AsyncStream<Frame>.makeStream()
     self.frameStream = stream
@@ -367,6 +375,15 @@ public actor AMQPTransport {
     frameDispatchTask = Task { [weak self] in
       while let self = self {
         guard let frame = await self.nextFrame() else { break }
+        switch frame {
+        case .method(channelID: 0, method: .connectionCloseOk):
+          await self.closeOkReceived()
+        case .method(channelID: 0, method: .connectionClose):
+          // The broker closed while ours was in flight: no close-ok follows.
+          await self.releaseCloseWaiter()
+        default:
+          break
+        }
         if let handler = await self.frameHandler {
           await handler(frame)
         }
@@ -375,11 +392,24 @@ public actor AMQPTransport {
       // `resetForRecovery` cancelled is reporting the previous socket's end,
       // which the next attempt's socket must not be charged with.
       if Task.isCancelled { return }
+      // No close-ok can follow the end of the stream.
+      await self?.releaseCloseWaiter()
       if let self = self, let onDisconnect = await self.onDisconnect {
         await self.markDisconnected()
         await onDisconnect()
       }
     }
+  }
+
+  private func closeOkReceived() {
+    receivedCloseOk = true
+    releaseCloseWaiter()
+  }
+
+  private func releaseCloseWaiter() {
+    closeWaitOver = true
+    closeWaiter?.resume()
+    closeWaiter = nil
   }
 
   private func markDisconnected() {
@@ -420,23 +450,35 @@ public actor AMQPTransport {
       return
     }
 
+    // Every other send is refused from here, so connection.close goes out
+    // last; it is written to the socket directly.
     isConnected = false
+
+    // The broker answers connection.close with close-ok and then waits for the
+    // client to drop the socket; a socket dropped before close-ok is logged as
+    // an abrupt close. The dispatcher must keep running to see the reply: a
+    // cancelled iterator finishes the frame stream. Without a dispatcher the
+    // handshake never completed and there is nobody to close.
+    if frameDispatchTask != nil {
+      let close = ConnectionClose(replyCode: 200, replyText: "Normal shutdown")
+      let frame = Frame.method(channelID: 0, method: .connectionClose(close))
+      if (try? await channel.writeAndFlush(frame).get()) != nil {
+        let bound = Task { [weak self] in
+          guard (try? await Task.sleep(for: .seconds(1))) != nil else { return }
+          await self?.releaseCloseWaiter()
+        }
+        await withCheckedContinuation { continuation in
+          if closeWaitOver {
+            continuation.resume()
+          } else {
+            closeWaiter = continuation
+          }
+        }
+        bound.cancel()
+      }
+    }
     frameDispatchTask?.cancel()
     frameDispatchTask = nil
-
-    let close = ConnectionClose(replyCode: 200, replyText: "Normal shutdown")
-    try? await send(.method(channelID: 0, method: .connectionClose(close)))
-
-    await withTaskGroup(of: Void.self) { group in
-      group.addTask {
-        _ = await self.nextFrame()
-      }
-      group.addTask {
-        try? await Task.sleep(for: .milliseconds(500))
-      }
-      _ = await group.next()
-      group.cancelAll()
-    }
 
     try? await channel.close().get()
     self.channel = nil

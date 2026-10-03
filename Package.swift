@@ -88,6 +88,7 @@ let package = Package(
             name: "IntegrationTests",
             dependencies: [
                 "BunnySwift",
+                "Transport",
                 .product(name: "RabbitMQHTTPAPIClient", package: "rabbitmq-http-api-client-swift"),
             ]
         ),
