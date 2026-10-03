@@ -376,9 +376,12 @@ public actor AMQPTransport {
   }
 
   private func startFrameDispatcher() {
+    // A dispatcher reads only the frame stream of the connection it was
+    // started on, never one a later connect installs.
+    let frames = frameIterator
     frameDispatchTask = Task { [weak self] in
       while let self = self {
-        guard let frame = await self.nextFrame() else { break }
+        guard let frame = await frames?.next() else { break }
         switch frame {
         case .method(channelID: 0, method: .connectionCloseOk):
           await self.closeOkReceived()
@@ -457,6 +460,12 @@ public actor AMQPTransport {
       return
     }
 
+    // A connect can run while this close waits for the broker and install a
+    // new socket, frame stream and dispatcher. This close tears down only the
+    // ones it started with.
+    let ownedFrames = frameIterator
+    let ownedDispatcher = frameDispatchTask
+
     // Every other send is refused from here, so connection.close goes out
     // last; it is written to the socket directly.
     isConnected = false
@@ -473,7 +482,7 @@ public actor AMQPTransport {
     // is still pending; a write that fails because the socket died ends the
     // frame stream, which releases the wait, and any other failure leaves the
     // release to the bound.
-    if frameDispatchTask != nil {
+    if ownedDispatcher != nil {
       let bound = Task { [weak self] in
         guard (try? await Task.sleep(for: .seconds(1))) != nil else { return }
         await self?.releaseCloseWaiter()
@@ -490,10 +499,15 @@ public actor AMQPTransport {
       }
       bound.cancel()
     }
-    frameDispatchTask?.cancel()
-    frameDispatchTask = nil
+    ownedDispatcher?.cancel()
+    if frameDispatchTask == ownedDispatcher {
+      frameDispatchTask = nil
+    }
 
     try? await channel.close().get()
+    // Every connect installs a new frame stream, so an unchanged one means
+    // the socket, stream and continuation are still the ones this close owns.
+    guard frameIterator === ownedFrames else { return }
     self.channel = nil
     self.frameIterator = nil
     self.frameStream = nil

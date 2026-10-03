@@ -400,6 +400,39 @@ struct RecoveryIntegrationTests {
       let recovered = await pollUntil { await connection.connected }
       #expect(recovered, "the connection did not recover")
     }
+
+    @Test("A socket lost in one connection recovery handler skips the later handlers until a retry holds")
+    func socketLostInFirstConnectionRecoveryHandlerSkipsLaterHandlers() async throws {
+      let name = "test.drop.skips.later.handlers.\(UUID().uuidString.prefix(8))"
+      let connection = try await RecoveryTestConfig.openConnection(name: name)
+      defer { Task { try? await connection.close() } }
+
+      let channel = try await connection.openChannel()
+      let firstRuns = ManagedAtomic(0)
+      let droppedInHandler = ManagedAtomic(false)
+      // The first handler's run count at each run of the second.
+      let secondRuns = ManagedAtomic<[Int]>([])
+      await connection.onRecovery {
+        let run = firstRuns.load() + 1
+        firstRuns.store(run)
+        guard run == 1 else { return }
+        droppedInHandler.store(await dropSocketAndAwaitLoss(on: channel, name: name))
+      }
+      await connection.onRecovery { secondRuns.store(secondRuns.load() + [firstRuns.load()]) }
+
+      try await closeAllConnectionsWithName(name)
+      let reported = await pollUntil(timeout: 30) { !secondRuns.load().isEmpty }
+      #expect(droppedInHandler.load(), "the socket was not lost inside the first handler")
+      #expect(reported, "the retried recovery never reached the second handler")
+      // Any run left over from the failed attempt would have landed by now.
+      try await Task.sleep(for: .milliseconds(500))
+      #expect(
+        secondRuns.load() == [2],
+        "the second handler ran for the attempt whose socket was lost: \(secondRuns.load())")
+      #expect(firstRuns.load() == 2, "the first handler ran \(firstRuns.load()) times, not 2")
+      let recovered = await pollUntil { await connection.connected }
+      #expect(recovered, "the connection did not recover")
+    }
   }
 
   // MARK: - Channel State Recovery

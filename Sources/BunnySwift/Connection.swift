@@ -363,10 +363,13 @@ public actor Connection {
 
         for handler in onRecoveryHandlers {
           await handler()
+          // A handler may close the connection, which reports nothing
+          // further. The socket may also drop while one runs: the handlers
+          // after it are not told of a recovery that did not hold, and the
+          // retry tells every handler again once one does.
+          if closedByClient { return }
+          guard isOpen else { throw ConnectionError.notConnected }
         }
-        // The same loss during these handlers: they were told of a recovery
-        // that did not hold, so retry and tell them again when one does.
-        guard isOpen || closedByClient else { throw ConnectionError.notConnected }
         return
       } catch {
         attempt += 1

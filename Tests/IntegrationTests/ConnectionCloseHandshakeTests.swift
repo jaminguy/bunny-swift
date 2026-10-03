@@ -102,6 +102,15 @@ private func timedClose(
   }
 }
 
+/// Accepts TCP connections and never writes to them, so a client handshake
+/// against it waits on `connection.start` until the client gives up.
+private func startSilentServer() async throws -> NIO.Channel {
+  try await ServerBootstrap(group: SharedEventLoopGroup.shared)
+    .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
+    .bind(host: "127.0.0.1", port: 0)
+    .get()
+}
+
 @Suite("Connection close handshake", .disabled(if: TestConfig.skipIntegrationTests))
 struct ConnectionCloseHandshakeTests {
 
@@ -171,5 +180,42 @@ struct ConnectionCloseHandshakeTests {
 
     let took = try #require(elapsed, "close never returned")
     #expect(took < .milliseconds(800), "close waited out its bound after a connect: \(took)")
+  }
+
+  @Test("A close released by a connect leaves the new socket and frame stream alone")
+  func closeReleasedByAConnectLeavesTheNewConnectionAlone() async throws {
+    let server = try await startSilentServer()
+    defer { server.close(promise: nil) }
+    let silentPort = try #require(server.localAddress?.port)
+    let transport = try await connectWithheld(.drop)
+    var silent = TestConfig.connectionConfiguration()
+    silent.port = silentPort
+
+    let closer = Task { await transport.close() }
+    try await Task.sleep(for: .milliseconds(200))
+    let connectEnded = ManagedAtomic(false)
+    let connecting = Task {
+      _ = try? await transport.connect(configuration: silent)
+      connectEnded.store(true)
+    }
+    await closer.value
+
+    // The new socket is up and its handshake waits on the silent server; the
+    // old close must neither drop the socket nor end the stream it reads.
+    var reachedServer = false
+    let deadline = ContinuousClock.now + .seconds(3)
+    while !reachedServer, ContinuousClock.now < deadline {
+      reachedServer = await transport.channel?.remoteAddress?.port == silentPort
+      if !reachedServer { try await Task.sleep(for: .milliseconds(50)) }
+    }
+    try await Task.sleep(for: .milliseconds(300))
+    let channel = await transport.channel
+    #expect(reachedServer, "the new connection's socket never came up")
+    #expect(channel?.remoteAddress?.port == silentPort, "the old close cleared the new socket")
+    #expect(channel?.isActive == true, "the new socket was closed")
+    #expect(!connectEnded.load(), "the new handshake ended: its frame stream was finished")
+
+    await transport.forceClose()
+    await connecting.value
   }
 }
