@@ -51,6 +51,11 @@ public actor Channel {
 
   // Consumers
   private var consumers: [String: AsyncStream<Message>.Continuation] = [:]
+
+  /// Advances on every connection loss. Delivery tags are scoped to one broker
+  /// channel, and recovery re-opens this one with tags counting from 1 again,
+  /// so a tag from an earlier generation names nothing or a different message.
+  private var deliveryGeneration: UInt64 = 0
   private var returnHandlers: [@Sendable (ReturnedMessage) -> Void] = []
 
   // Channel close event handlers
@@ -764,19 +769,30 @@ public actor Channel {
 
   public func basicAck(deliveryTag: UInt64, multiple: Bool = false) async throws {
     let ack = BasicAck(deliveryTag: deliveryTag, multiple: multiple)
-    try await sendMethod(.basicAck(ack))
+    try await settle(.basicAck(ack), generation: deliveryGeneration)
   }
 
   public func basicNack(deliveryTag: UInt64, multiple: Bool = false, requeue: Bool = true)
     async throws
   {
     let nack = BasicNack(deliveryTag: deliveryTag, multiple: multiple, requeue: requeue)
-    try await sendMethod(.basicNack(nack))
+    try await settle(.basicNack(nack), generation: deliveryGeneration)
   }
 
   public func basicReject(deliveryTag: UInt64, requeue: Bool = true) async throws {
     let reject = BasicReject(deliveryTag: deliveryTag, requeue: requeue)
-    try await sendMethod(.basicReject(reject))
+    try await settle(.basicReject(reject), generation: deliveryGeneration)
+  }
+
+  /// Sends an ack, nack or reject for a delivery received in `generation`.
+  /// On a channel the broker has closed, any method earns a connection-level
+  /// 504; after recovery, the old tag would settle a different delivery,
+  /// which the broker has in any case redelivered.
+  internal func settle(_ method: AMQPMethod, generation: UInt64) async throws {
+    guard isOpen, generation == deliveryGeneration else {
+      throw ConnectionError.notConnected
+    }
+    try await sendMethod(method)
   }
 
   // MARK: - QoS
@@ -1043,7 +1059,8 @@ public actor Channel {
         body: body,
         properties: incoming.properties,
         deliveryInfo: deliveryInfo,
-        channel: self
+        channel: self,
+        deliveryGeneration: deliveryGeneration
       )
       consumers[deliveryInfo.consumerTag]?.yield(message)
     } else if let getInfo = incoming.getInfo {
@@ -1055,7 +1072,8 @@ public actor Channel {
         exchange: getInfo.exchange,
         routingKey: getInfo.routingKey,
         messageCount: getInfo.messageCount,
-        channel: self
+        channel: self,
+        deliveryGeneration: deliveryGeneration
       )
       if let cont = pendingGetResponses.first {
         pendingGetResponses.removeFirst()
@@ -1116,6 +1134,7 @@ public actor Channel {
     }
     pendingGetResponses.removeAll()
     isOpen = false
+    deliveryGeneration += 1
     failOutstandingConfirms(with: error)
     incomingMessage = nil
   }

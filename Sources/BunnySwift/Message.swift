@@ -15,27 +15,33 @@ public struct Message: Sendable {
   public let properties: BasicProperties
   public let deliveryInfo: DeliveryInfo
   private let channel: Channel
+  private let deliveryGeneration: UInt64
 
   internal init(
-    body: Data, properties: BasicProperties, deliveryInfo: DeliveryInfo, channel: Channel
+    body: Data, properties: BasicProperties, deliveryInfo: DeliveryInfo, channel: Channel,
+    deliveryGeneration: UInt64
   ) {
     self.body = body
     self.properties = properties
     self.deliveryInfo = deliveryInfo
     self.channel = channel
+    self.deliveryGeneration = deliveryGeneration
   }
 
   public func ack(multiple: Bool = false) async throws {
-    try await channel.basicAck(deliveryTag: deliveryInfo.deliveryTag, multiple: multiple)
+    let ack = BasicAck(deliveryTag: deliveryInfo.deliveryTag, multiple: multiple)
+    try await channel.settle(.basicAck(ack), generation: deliveryGeneration)
   }
 
   public func nack(multiple: Bool = false, requeue: Bool = true) async throws {
-    try await channel.basicNack(
+    let nack = BasicNack(
       deliveryTag: deliveryInfo.deliveryTag, multiple: multiple, requeue: requeue)
+    try await channel.settle(.basicNack(nack), generation: deliveryGeneration)
   }
 
   public func reject(requeue: Bool = true) async throws {
-    try await channel.basicReject(deliveryTag: deliveryInfo.deliveryTag, requeue: requeue)
+    let reject = BasicReject(deliveryTag: deliveryInfo.deliveryTag, requeue: requeue)
+    try await channel.settle(.basicReject(reject), generation: deliveryGeneration)
   }
 
   public var bodyString: String? {
@@ -57,6 +63,7 @@ public struct GetResponse: Sendable {
   public let routingKey: String
   public let messageCount: UInt32
   private let channel: Channel
+  private let deliveryGeneration: UInt64
 
   internal init(
     body: Data,
@@ -66,7 +73,8 @@ public struct GetResponse: Sendable {
     exchange: String,
     routingKey: String,
     messageCount: UInt32,
-    channel: Channel
+    channel: Channel,
+    deliveryGeneration: UInt64
   ) {
     self.body = body
     self.properties = properties
@@ -76,18 +84,22 @@ public struct GetResponse: Sendable {
     self.routingKey = routingKey
     self.messageCount = messageCount
     self.channel = channel
+    self.deliveryGeneration = deliveryGeneration
   }
 
   public func ack(multiple: Bool = false) async throws {
-    try await channel.basicAck(deliveryTag: deliveryTag, multiple: multiple)
+    let ack = BasicAck(deliveryTag: deliveryTag, multiple: multiple)
+    try await channel.settle(.basicAck(ack), generation: deliveryGeneration)
   }
 
   public func nack(multiple: Bool = false, requeue: Bool = true) async throws {
-    try await channel.basicNack(deliveryTag: deliveryTag, multiple: multiple, requeue: requeue)
+    let nack = BasicNack(deliveryTag: deliveryTag, multiple: multiple, requeue: requeue)
+    try await channel.settle(.basicNack(nack), generation: deliveryGeneration)
   }
 
   public func reject(requeue: Bool = true) async throws {
-    try await channel.basicReject(deliveryTag: deliveryTag, requeue: requeue)
+    let reject = BasicReject(deliveryTag: deliveryTag, requeue: requeue)
+    try await channel.settle(.basicReject(reject), generation: deliveryGeneration)
   }
 
   public var bodyString: String? {
