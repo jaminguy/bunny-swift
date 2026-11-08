@@ -44,7 +44,9 @@ public actor Channel {
   // is written, so a reply that lands before the caller parks its continuation
   // is kept for it instead of dropped (see `rpc`).
   private var pendingResponses: [PendingResponse] = []
-  private var pendingGetResponses: [CheckedContinuation<GetResponse?, Error>] = []
+  // Pending basic.get replies, queued before the request is written for the
+  // same reason.
+  private var pendingGetResponses: [PendingGet] = []
 
   // Message assembly
   private var incomingMessage: IncomingMessage?
@@ -693,34 +695,64 @@ public actor Channel {
     exclusive: Bool = false,
     arguments: Table = [:]
   ) async throws -> MessageStream {
+    // The broker may send deliveries right behind consume-ok, and they can
+    // reach this actor before the caller resumes from `rpc`. The stream is
+    // therefore registered under a tag known before the request is written,
+    // which means the client chooses it when the caller does not.
+    let tag = consumerTag.isEmpty ? Self.generateConsumerTag() : consumerTag
+    guard consumers[tag] == nil else {
+      throw ConnectionError.protocolError("Consumer tag \(tag) is already in use on this channel")
+    }
+    let (stream, continuation) = AsyncStream<Message>.makeStream()
+    consumers[tag] = continuation
+
     let consume = BasicConsume(
       reserved1: 0,
       queue: queue,
-      consumerTag: consumerTag,
+      consumerTag: tag,
       noLocal: false,
       noAck: acknowledgementMode.noAckFieldValue,
       exclusive: exclusive,
       noWait: false,
       arguments: arguments
     )
-    let response = try await rpc(.basicConsume(consume))
+    let response: AMQPMethod
+    do {
+      response = try await rpc(.basicConsume(consume))
+    } catch {
+      removeConsumer(tag)
+      throw error
+    }
     guard case .basicConsumeOk(let ok) = response else {
+      removeConsumer(tag)
       throw ConnectionError.protocolError("Expected Basic.ConsumeOk, got \(response)")
     }
-
-    let (stream, continuation) = AsyncStream<Message>.makeStream()
-    consumers[ok.consumerTag] = continuation
+    guard ok.consumerTag == tag else {
+      removeConsumer(tag)
+      // The broker is delivering under a tag this channel never registered;
+      // cancel it so its deliveries stop instead of cycling through requeue.
+      try? await basicCancel(ok.consumerTag)
+      throw ConnectionError.protocolError(
+        "Basic.ConsumeOk carried consumer tag \(ok.consumerTag), expected \(tag)")
+    }
 
     await connection?.topologyRegistry.recordConsumer(
       RecordedConsumer(
-        consumerTag: ok.consumerTag,
+        consumerTag: tag,
         queue: queue,
         acknowledgementMode: acknowledgementMode,
         exclusive: exclusive,
         arguments: arguments
       ))
 
-    return MessageStream(channel: self, consumerTag: ok.consumerTag, stream: stream)
+    return MessageStream(channel: self, consumerTag: tag, stream: stream)
+  }
+
+  /// A client-chosen consumer tag, unique across channels and connections.
+  /// Bunny and Pika also choose the tag on the client when the caller passes
+  /// none; the `amq.` prefix is left to the broker's own tags.
+  private static func generateConsumerTag() -> String {
+    "bunny-swift-\(UUID().uuidString.lowercased())"
   }
 
   public func basicCancel(_ consumerTag: String) async throws {
@@ -753,10 +785,23 @@ public actor Channel {
     async throws -> GetResponse?
   {
     let get = BasicGet(reserved1: 0, queue: queue, noAck: acknowledgementMode.noAckFieldValue)
-    try await sendMethod(.basicGet(get))
+    let pending = PendingGet()
+    pendingGetResponses.append(pending)
+    do {
+      try await sendMethod(.basicGet(get))
+    } catch {
+      if let index = pendingGetResponses.firstIndex(where: { $0 === pending }) {
+        pendingGetResponses.remove(at: index)
+      }
+      throw error
+    }
 
     return try await withCheckedThrowingContinuation { cont in
-      pendingGetResponses.append(cont)
+      if let outcome = pending.outcome {
+        cont.resume(with: outcome)
+      } else {
+        pending.continuation = cont
+      }
     }
   }
 
@@ -960,8 +1005,8 @@ public actor Channel {
         pending.settle(.failure(error))
       }
       pendingResponses.removeAll()
-      for cont in pendingGetResponses {
-        cont.resume(throwing: error)
+      for pending in pendingGetResponses {
+        pending.settle(.failure(error))
       }
       pendingGetResponses.removeAll()
       failOutstandingConfirms(with: error)
@@ -994,9 +1039,8 @@ public actor Channel {
       )
 
     case .basicGetEmpty:
-      if let cont = pendingGetResponses.first {
-        pendingGetResponses.removeFirst()
-        cont.resume(returning: nil)
+      if !pendingGetResponses.isEmpty {
+        pendingGetResponses.removeFirst().settle(.success(nil))
       }
 
     case .basicReturn(let ret):
@@ -1046,7 +1090,15 @@ public actor Channel {
         deliveryInfo: deliveryInfo,
         channel: self
       )
-      consumers[deliveryInfo.consumerTag]?.yield(message)
+      guard let consumer = consumers[deliveryInfo.consumerTag] else {
+        // No stream will ever see this delivery, so hand it back to the queue
+        // rather than leave it unacked until the channel closes. A failed nack
+        // means the channel is gone, and its close requeues the delivery.
+        try? await basicNack(
+          deliveryTag: deliveryInfo.deliveryTag, multiple: false, requeue: true)
+        return
+      }
+      consumer.yield(message)
     } else if let getInfo = incoming.getInfo {
       let response = GetResponse(
         body: body,
@@ -1058,9 +1110,8 @@ public actor Channel {
         messageCount: getInfo.messageCount,
         channel: self
       )
-      if let cont = pendingGetResponses.first {
-        pendingGetResponses.removeFirst()
-        cont.resume(returning: response)
+      if !pendingGetResponses.isEmpty {
+        pendingGetResponses.removeFirst().settle(.success(response))
       }
     } else if let returnInfo = incoming.returnInfo {
       let returned = ReturnedMessage(
@@ -1112,8 +1163,8 @@ public actor Channel {
       pending.settle(.failure(error))
     }
     pendingResponses.removeAll()
-    for cont in pendingGetResponses {
-      cont.resume(throwing: error)
+    for pending in pendingGetResponses {
+      pending.settle(.failure(error))
     }
     pendingGetResponses.removeAll()
     isOpen = false
@@ -1164,7 +1215,7 @@ public actor Channel {
     let error = ConnectionError.notConnected
     for pending in pendingResponses { pending.settle(.failure(error)) }
     pendingResponses.removeAll()
-    for cont in pendingGetResponses { cont.resume(throwing: error) }
+    for pending in pendingGetResponses { pending.settle(.failure(error)) }
     pendingGetResponses.removeAll()
     failOutstandingConfirms(with: error)
 
@@ -1405,6 +1456,23 @@ private final class PendingResponse {
   var requestSent = false
 
   func settle(_ result: Result<AMQPMethod, Error>) {
+    if let continuation {
+      self.continuation = nil
+      continuation.resume(with: result)
+    } else if outcome == nil {
+      outcome = result
+    }
+  }
+}
+
+/// One in-flight basic.get, confined to the channel actor. The get-ok or
+/// get-empty, or the error that ends the wait, goes to the parked
+/// continuation, or is held until the caller parks when it arrives first.
+private final class PendingGet {
+  var continuation: CheckedContinuation<GetResponse?, Error>?
+  var outcome: Result<GetResponse?, Error>?
+
+  func settle(_ result: Result<GetResponse?, Error>) {
     if let continuation {
       self.continuation = nil
       continuation.resume(with: result)
