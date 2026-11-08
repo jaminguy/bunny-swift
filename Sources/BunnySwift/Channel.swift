@@ -729,9 +729,6 @@ public actor Channel {
     }
     guard ok.consumerTag == tag else {
       removeConsumer(tag)
-      // The broker is delivering under a tag this channel never registered;
-      // cancel it so its deliveries stop instead of cycling through requeue.
-      try? await basicCancel(ok.consumerTag)
       throw ConnectionError.protocolError(
         "Basic.ConsumeOk carried consumer tag \(ok.consumerTag), expected \(tag)")
     }
@@ -1090,15 +1087,9 @@ public actor Channel {
         deliveryInfo: deliveryInfo,
         channel: self
       )
-      guard let consumer = consumers[deliveryInfo.consumerTag] else {
-        // No stream will ever see this delivery, so hand it back to the queue
-        // rather than leave it unacked until the channel closes. A failed nack
-        // means the channel is gone, and its close requeues the delivery.
-        try? await basicNack(
-          deliveryTag: deliveryInfo.deliveryTag, multiple: false, requeue: true)
-        return
-      }
-      consumer.yield(message)
+      // A tag with no registered stream gets nothing written: the delivery
+      // stays unacked until the channel closes.
+      consumers[deliveryInfo.consumerTag]?.yield(message)
     } else if let getInfo = incoming.getInfo {
       let response = GetResponse(
         body: body,

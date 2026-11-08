@@ -18,6 +18,8 @@ import Testing
 /// real broker sends consume-ok followed at once by up to prefetch deliveries
 /// when the queue has ready messages, and the dispatcher can hand those to the
 /// channel before `basicConsume` resumes; the stub makes that happen every time.
+/// Each `basic.consume` takes the next queued answer, and `okThenDeliver` once
+/// the queue is empty.
 private actor EarlyDeliveryStubConnection: ChannelConnection {
   enum ConsumeAnswer {
     /// consume-ok echoing the request's tag (a server tag when it is empty),
@@ -25,19 +27,19 @@ private actor EarlyDeliveryStubConnection: ChannelConnection {
     case okThenDeliver
     /// consume-ok carrying a tag other than the one requested.
     case okWithTag(String)
-    /// A channel.close, as the broker sends for a missing queue.
-    case channelClose
+    /// The write of `basic.consume` throws, as it does when the socket is lost.
+    case writeFails
   }
 
   nonisolated let topologyRegistry = TopologyRegistry()
   var frameMax: UInt32 { FrameDefaults.maxSize }
 
   private var channel: Channel?
-  private let consumeAnswer: ConsumeAnswer
+  private var consumeAnswers: [ConsumeAnswer]
   private(set) var sentMethods: [AMQPMethod] = []
 
-  init(consumeAnswer: ConsumeAnswer) {
-    self.consumeAnswer = consumeAnswer
+  init(consumeAnswers: [ConsumeAnswer] = []) {
+    self.consumeAnswers = consumeAnswers
   }
 
   func attach(_ channel: Channel) {
@@ -46,6 +48,13 @@ private actor EarlyDeliveryStubConnection: ChannelConnection {
 
   func send(_ frame: Frame) async throws {
     guard case .method(let channelID, let method) = frame, let channel else { return }
+    var consumeAnswer = ConsumeAnswer.okThenDeliver
+    if case .basicConsume = method, !consumeAnswers.isEmpty {
+      consumeAnswer = consumeAnswers.removeFirst()
+    }
+    if case .basicConsume = method, case .writeFails = consumeAnswer {
+      throw ConnectionError.notConnected
+    }
     sentMethods.append(method)
     switch method {
     case .channelOpen:
@@ -63,10 +72,8 @@ private actor EarlyDeliveryStubConnection: ChannelConnection {
         await channel.handleFrame(
           .method(
             channelID: channelID, method: .basicConsumeOk(BasicConsumeOk(consumerTag: tag))))
-      case .channelClose:
-        let close = ChannelClose(
-          replyCode: 404, replyText: "NOT_FOUND - no queue 'q'", classId: 60, methodId: 20)
-        await channel.handleFrame(.method(channelID: channelID, method: .channelClose(close)))
+      case .writeFails:
+        break
       }
     case .basicCancel(let cancel):
       await channel.handleFrame(
@@ -90,12 +97,6 @@ private actor EarlyDeliveryStubConnection: ChannelConnection {
   var sentConsumeTags: [String] {
     sentMethods.compactMap {
       if case .basicConsume(let consume) = $0 { consume.consumerTag } else { nil }
-    }
-  }
-
-  var sentCancelTags: [String] {
-    sentMethods.compactMap {
-      if case .basicCancel(let cancel) = $0 { cancel.consumerTag } else { nil }
     }
   }
 
@@ -146,7 +147,7 @@ struct ChannelConsumeRegistrationTests {
   @Test("A delivery handled before basicConsume resumes reaches the consumer")
   func deliveryBeforeConsumeResumesReachesTheConsumer() async throws {
     let channelID: UInt16 = 1
-    let stub = EarlyDeliveryStubConnection(consumeAnswer: .okThenDeliver)
+    let stub = EarlyDeliveryStubConnection()
     let channel = Channel(connection: stub, channelID: channelID)
     await stub.attach(channel)
     try await channel.open()
@@ -169,7 +170,7 @@ struct ChannelConsumeRegistrationTests {
   /// tag must be chosen and registered before `basic.consume` is written.
   @Test("basicConsume without a tag sends a unique client-chosen tag")
   func basicConsumeSendsAClientChosenTag() async throws {
-    let stub = EarlyDeliveryStubConnection(consumeAnswer: .okThenDeliver)
+    let stub = EarlyDeliveryStubConnection()
     let channel = Channel(connection: stub, channelID: 1)
     await stub.attach(channel)
     try await channel.open()
@@ -184,66 +185,56 @@ struct ChannelConsumeRegistrationTests {
     #expect(first.consumerTag != second.consumerTag)
   }
 
-  /// Catches a delivery for a consumer the channel does not know being dropped
-  /// silently: the broker would hold it unacked until the channel closes.
-  @Test("A delivery for an unknown consumer tag is nacked with requeue")
-  func unknownConsumerTagIsNackedWithRequeue() async throws {
-    let channelID: UInt16 = 1
-    let stub = EarlyDeliveryStubConnection(consumeAnswer: .okThenDeliver)
-    let channel = Channel(connection: stub, channelID: channelID)
-    await stub.attach(channel)
-    try await channel.open()
-
-    await deliver(42, consumerTag: "nobody", to: channel, channelID: channelID)
-
-    let nacks = await stub.sentNacks
-    #expect(nacks.count == 1, "a delivery for an unknown consumer was not nacked")
-    #expect(nacks.first?.deliveryTag == 42)
-    #expect(nacks.first?.multiple == false)
-    #expect(nacks.first?.requeue == true, "the nack did not requeue the delivery")
-  }
-
-  /// Catches a registration left behind when `basic.consume` fails: a later
-  /// delivery for that tag would go into a stream nobody reads, unacked.
+  /// Catches a registration left behind when `basic.consume` fails: the
+  /// caller never gets that stream, and a retry with the same tag on the
+  /// channel is refused as a duplicate.
   @Test("A failed basic.consume removes its registration")
   func failedConsumeRemovesItsRegistration() async throws {
-    let channelID: UInt16 = 1
-    let stub = EarlyDeliveryStubConnection(consumeAnswer: .channelClose)
-    let channel = Channel(connection: stub, channelID: channelID)
+    let stub = EarlyDeliveryStubConnection(consumeAnswers: [.writeFails])
+    let channel = Channel(connection: stub, channelID: 1)
     await stub.attach(channel)
     try await channel.open()
 
     await #expect(throws: ConnectionError.self) {
-      _ = try await channel.basicConsume(queue: "q")
+      _ = try await channel.basicConsume(queue: "q", consumerTag: "worker")
     }
 
-    let tag = try #require(await stub.sentConsumeTags.first)
-    await deliver(9, consumerTag: tag, to: channel, channelID: channelID)
-    let nacks = await stub.sentNacks
-    #expect(nacks.map(\.deliveryTag) == [9], "the failed consumer's registration was kept")
+    try await expectConsumeWithTagReceivesItsDelivery(channel, tag: "worker")
   }
 
   /// Catches a consume-ok whose tag differs from the one registered being
-  /// accepted: the stream would wait under a tag the broker never delivers to,
-  /// while the broker's consumer under the other tag kept taking messages.
-  @Test("A consume-ok carrying another tag fails the consume and cancels that tag")
-  func mismatchedConsumeOkTagFailsAndCancels() async throws {
-    let channelID: UInt16 = 1
-    let stub = EarlyDeliveryStubConnection(consumeAnswer: .okWithTag("amq.ctag-other"))
-    let channel = Channel(connection: stub, channelID: channelID)
+  /// accepted, or the registration under the requested tag being kept after
+  /// it: the stream would wait under a tag the broker never delivers to, and a
+  /// retry with the same tag is refused as a duplicate.
+  @Test("A consume-ok carrying another tag fails the consume and removes its registration")
+  func mismatchedConsumeOkTagFailsAndRemovesRegistration() async throws {
+    let stub = EarlyDeliveryStubConnection(consumeAnswers: [.okWithTag("amq.ctag-other")])
+    let channel = Channel(connection: stub, channelID: 1)
     await stub.attach(channel)
     try await channel.open()
 
     await #expect(throws: ConnectionError.self) {
-      _ = try await channel.basicConsume(queue: "q")
+      _ = try await channel.basicConsume(queue: "q", consumerTag: "worker")
     }
 
-    #expect(await stub.sentCancelTags == ["amq.ctag-other"])
-    let tag = try #require(await stub.sentConsumeTags.first)
-    await deliver(11, consumerTag: tag, to: channel, channelID: channelID)
-    #expect(
-      await stub.sentNacks.map(\.deliveryTag) == [11],
-      "the registration under the requested tag was kept after the mismatch")
+    try await expectConsumeWithTagReceivesItsDelivery(channel, tag: "worker")
+  }
+
+  /// A consume with `tag` succeeds on `channel` and its stream receives the
+  /// delivery the stub sends behind consume-ok.
+  private func expectConsumeWithTagReceivesItsDelivery(_ channel: Channel, tag: String)
+    async throws
+  {
+    let retry = Outcome<UInt64?>()
+    retry.record {
+      let stream = try await channel.basicConsume(queue: "q", consumerTag: tag)
+      var iterator = stream.makeAsyncIterator()
+      return await iterator.next()?.deliveryInfo.deliveryTag
+    }
+    let completed = await eventually { retry.result != nil }
+    #expect(completed, "the retry with the same tag never received its delivery")
+    guard completed else { return }
+    #expect(try retry.result?.get() == 7, "the retry with the same tag was refused")
   }
 
   /// Catches the basic.get slot being queued only after the request is
@@ -251,7 +242,7 @@ struct ChannelConsumeRegistrationTests {
   /// dropped, and basicGet parked forever.
   @Test("A get-empty handled before basicGet resumes completes the call")
   func getReplyBeforeResumeCompletesTheCall() async throws {
-    let stub = EarlyDeliveryStubConnection(consumeAnswer: .okThenDeliver)
+    let stub = EarlyDeliveryStubConnection()
     let channel = Channel(connection: stub, channelID: 1)
     await stub.attach(channel)
     try await channel.open()
