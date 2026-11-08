@@ -1087,8 +1087,9 @@ public actor Channel {
         deliveryInfo: deliveryInfo,
         channel: self
       )
-      // A tag with no registered stream gets nothing written: the delivery
-      // stays unacked until the channel closes.
+      // A tag with no registered stream gets nothing written. A manual-ack
+      // delivery stays unacked until the channel closes; an automatic-ack
+      // delivery is gone.
       consumers[deliveryInfo.consumerTag]?.yield(message)
     } else if let getInfo = incoming.getInfo {
       let response = GetResponse(
